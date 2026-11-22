@@ -1,0 +1,4 @@
+PyQt6>=6.4
+pyserial>=3.5
+# map with aerial photos; without it the window draws a plain ground track
+PyQt6-WebEngine>=6.4

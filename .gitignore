@@ -1,0 +1,5 @@
+gui/logs/
+test/fw_host_test
+__pycache__/
+*.pyc
+build/
