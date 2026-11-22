@@ -6,6 +6,9 @@ commands wait for the next 10 s RX window, the rocket answers with an ACK,
 PREPARE / COUNTDOWN / ABORT change its state, and a countdown ends in a
 simulated flight — a supersonic Zenith flight with drogue and main, or a
 Daidalos hop with apogee, a nose-first fall and a propulsive landing.
+In STAND mode it plays the rampa as a thrust stand: ARM -> erase -> ARMED,
+FIRE -> countdown -> igniter -> a ~2.5 s motor burn with chamber pressure and
+case heating, results ($SR) and the 100 Hz curve on request ($SC).
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ class DemoStation(QtCore.QObject):
         self._win = None
         self._next_t = self._next_s = self._next_g = 0.0
         self._ack_due = False
+        self._stand_reset()
 
     def now(self) -> float:
         return (time.time() - self.t0) * self.speed
@@ -59,7 +63,7 @@ class DemoStation(QtCore.QObject):
             self.line.emit(f"$ID,Ground Station,2.00,{self.mode}")
             self.line.emit(f"$MODE,{self.mode}")
         elif c == "MODE":
-            if len(p) > 1 and p[1].upper() in ("ZENITH", "ARIADNA") and p[1].upper() != self.mode:
+            if len(p) > 1 and p[1].upper() in ("ZENITH", "ARIADNA", "STAND") and p[1].upper() != self.mode:
                 if self.pending:
                     self._u("CANCELLED")
                 self.mode = p[1].upper()
@@ -71,6 +75,8 @@ class DemoStation(QtCore.QObject):
                 self._u("CANCELLED")
             self.pending = None
             self.line.emit("#OK CANCEL")
+        elif c == "CMD" and len(p) >= 2 and self.mode == "STAND":
+            self._stand_cmd(p[1].upper(), p[2:])
         elif c == "CMD" and len(p) >= 2:
             name = p[1].upper()
             if self.mode == "ARIADNA" and name in ("MAINALT", "LOCATE", "CAMERA", "ROCKETPWR"):
@@ -135,6 +141,12 @@ class DemoStation(QtCore.QObject):
         win = int(t // 10.0)
         crossed = self._win is not None and win != self._win
         self._win = win
+        if self.mode == "STAND":
+            self._stand(t)
+            if t >= self._next_g:
+                self._next_g = t + 1.0
+                self.line.emit(f"$G,{int(t * 7)},0,90,0,-1,{1 if self.sp else 0},0,-1,STAND,0,1,1")
+            return
         if self.pending and crossed:
             self.pending[4] += 1
             seq, name, args, _dest, tries, _tq = self.pending
@@ -275,3 +287,203 @@ class DemoStation(QtCore.QObject):
                 f"{5.5 if burn else 1.2:.1f}", "0.9", 13, (fired << 4) | cont, 0xFF, flags, events, 0xF4,
                 min(255, int(tf)), int(math.sin(tf * 0.3) * 3), int(math.sin(tf * 0.2) * 4)]
         self.line.emit("$AT," + ",".join(str(v) for v in vals))
+
+    # ---------------------------------------------------------------- thrust stand (rampa)
+    ST_NAMES = ["PING", "ARM", "DISARM", "FIRE", "ABORT", "TARE", "RECORD", "STOP", "RESULT", "CURVE", "BUZZER",
+                "RECTIME", "CAL", "PZERO"]
+    ALIAS = {"SAFE": "DISARM", "COUNTDOWN": "FIRE", "CD": "FIRE", "REC": "RECORD", "LOCATE": "BUZZER", "NOP": "PING"}
+
+    def _stand_reset(self):
+        self.ss = 0                 # sl_state_t
+        self.sp = None              # pending [seq, name, args, sent]
+        self.s_seq = 0
+        self.s_ack = (0, 0)
+        self.s_t = 0.0              # time of entering the state
+        self.s_t0 = None
+        self.s_fire_ms, self.s_ch, self.s_rec = 1000, 1, 8
+        self.s_cold = 0.0
+        self.s_test = 4
+        self.s_res = None
+        self.s_curve: list = []
+        self.s_peak = 0.0
+        self.s_hang = False
+        self.s_faults = 0
+        self.s_next = 0.0
+        self.s_reply: list = []
+        self.s_buzz = False
+        self.s_tared = False
+
+    def _stand_cmd(self, name: str, args: list):
+        name = self.ALIAS.get(name, name)
+        if name not in self.ST_NAMES:
+            self.line.emit(f"#ERR unknown STAND command {name}")
+            return
+        if self.sp and self.sp[1] == "ABORT" and name != "ABORT":
+            self.line.emit("#ERR abort pending")
+            return
+        self.s_seq = self.s_seq % 255 + 1
+        self.sp = [self.s_seq, name, args, 0]
+        self.line.emit(f"$U,{self.s_seq},{name},2,QUEUED,0,0")
+        self.line.emit(f"#OK queued {name} seq {self.s_seq}")
+
+    def _stand_force(self, tb: float) -> float:
+        """Motor model: 0.25 s ignition delay, spike, regressive 2.4 s burn."""
+        if tb < 0.25 or tb > 2.9:
+            return 0.0
+        x = tb - 0.25
+        return 210 * (x / 0.08) if x < 0.08 else 210 - 55 * (x - 0.08) / 2.5 if x < 2.5 else max(0.0, 155 * (1 - (x - 2.5) / 0.15))
+
+    def _stand_exec(self, name: str, args: list, t: float) -> int:
+        a0 = float(args[0]) if args else 0.0
+        if name == "PING":
+            return 1
+        if name == "ABORT":
+            if self.ss in (4, 5):
+                self.ss = 5
+            else:
+                self.ss, self.s_t, self.s_t0 = 6, t, None
+            return 5
+        if name == "DISARM":
+            if self.ss in (4, 5, 7):
+                return 2
+            self.ss, self.s_t0, self.s_faults = 0, None, 0
+            return 1
+        if name == "ARM":
+            if self.ss != 0:
+                return 2
+            self.s_ch = int(a0) or 1
+            self.s_fire_ms = int(float(args[1])) if len(args) > 1 else 1000
+            if self.s_ch != 1:          # the demo igniter is on output 1
+                self.s_faults = 0x04
+                return 3
+            self.ss, self.s_t, self.s_hang, self.s_faults = 1, t, False, 0
+            return 1
+        if name == "FIRE":
+            if self.ss != 2:
+                return 2
+            self.ss, self.s_t, self.s_t0 = 3, t, t + a0
+            return 1
+        if name in ("TARE", "PZERO", "CAL"):
+            if name == "TARE":
+                self.s_tared = True
+            return 1 if self.ss in (0, 2) else 2
+        if name == "RECORD":
+            if self.ss != 0:
+                return 2
+            self.ss, self.s_t, self.s_t0, self.s_cold = 7, t, t, a0
+            self.s_curve, self.s_peak = [], 0.0
+            return 1
+        if name == "STOP":
+            if self.ss in (5, 7):
+                self.s_cold = 0.0
+                self.s_rec = 0
+                return 1
+            return 2
+        if name == "RECTIME":
+            self.s_rec = int(a0)
+            return 1
+        if name == "BUZZER":
+            self.s_buzz = a0 != 0
+            return 1
+        if name == "RESULT":
+            if not self.s_res:
+                return 2
+            self.s_reply.append(("SR", 0))
+            return 1
+        if name == "CURVE":
+            if not self.s_res:
+                return 2
+            self.s_reply.append(("SC", int(a0)))
+            return 1
+        return 4
+
+    def _stand_finish(self, t: float, cold: bool):
+        fired = not cold
+        thr = max(2.0, 0.05 * self.s_peak)
+        t0i = 0 if cold else 100
+        above = [i for i, (f, _p) in enumerate(self.s_curve) if f > thr and i >= t0i]
+        ign = bool(above) and self.s_peak > 2.0
+        burn = (above[-1] - above[0] + 1) / 100 if ign else 0.0
+        imp = sum(self.s_curve[i][0] for i in range(above[0], above[-1] + 1)) / 100 if ign else 0.0
+        self.s_test += 1
+        flags = (1 if fired else 0) | (2 if ign else 0) | 8 | 16 | (32 if cold else 0) | 64
+        tpk = (max(range(len(self.s_curve)), key=lambda i: self.s_curve[i][0]) - t0i) / 100 if self.s_curve else 0
+        pmax = max((p for _f, p in self.s_curve), default=0.0)
+        self.s_res = [self.s_test, flags, self.s_ch, f"{self.s_peak:.3f}", f"{imp:.4f}", f"{burn:.3f}",
+                      f"{imp / burn if burn else 0:.3f}", f"{tpk:.3f}", f"{(above[0] - t0i) / 100 if ign else 0:.3f}",
+                      f"{pmax:.2f}", "61.5", "24.0", len(self.s_curve), 100, len(self.s_curve) * 20, 2000,
+                      -1 if cold else t0i]
+        self.s_hang = fired and not ign
+        self.ss, self.s_t, self.s_t0 = 0, t, None
+        self.s_reply += [("SR", 0), ("SR", 0)]
+
+    def _stand(self, t: float):
+        # recording at 100 Hz (the curve) while a test runs
+        if self.ss in (3, 4, 5, 7) and self.s_t0 is not None:
+            rel = t - self.s_t0
+            if self.ss == 3 and rel >= -1.0 and not self.s_curve:
+                self.s_curve = []
+            if rel >= -1.0 or self.ss == 7:
+                n_should = int((rel + (0 if self.ss == 7 else 1.0)) * 100)
+                while len(self.s_curve) < n_should:
+                    tb = len(self.s_curve) / 100 - (0 if self.ss == 7 else 1.0)
+                    f = self._stand_force(tb) if self.ss != 7 else 0.0
+                    self.s_curve.append((f, f * 1.6))
+                    self.s_peak = max(self.s_peak, f)
+        if self.ss == 1 and t - self.s_t > 1.2:
+            self.ss, self.s_t = 2, t
+        if self.ss == 3 and t >= self.s_t0:
+            self.ss, self.s_t, self.s_curve, self.s_peak = 4, t, self.s_curve, 0.0
+        if self.ss == 4 and t - self.s_t0 > self.s_fire_ms / 1000:
+            self.ss = 5
+        if self.ss == 5 and t - self.s_t0 > self.s_rec:
+            self._stand_finish(t, False)
+        if self.ss == 7 and t - self.s_t0 > self.s_cold:
+            self._stand_finish(t, True)
+
+        # station -> rampa: the pending command goes right after a TLM
+        if self.sp and self.sp[3] == 0 and t >= self.s_next - 0.15:
+            self.sp[3] = 1
+            seq, name, args, _ = self.sp
+            self.line.emit(f"$U,{seq},{name},2,SENT,0,1")
+            rc = self._stand_exec(name, args, t)
+            self.s_ack = (seq, rc)
+            if name == "CURVE" and rc == 1:
+                self.line.emit(f"$U,{seq},{name},2,ACK,1,1")
+                self.sp = None
+        for kind, arg in self.s_reply:
+            if kind == "SR" and self.s_res:
+                self.line.emit("$SR," + ",".join(str(v) for v in self.s_res))
+            elif kind == "SC" and self.s_res:
+                pts = [(f, p) for f, p in self.s_curve[arg:arg + 16]]
+                vals = [f"{f:.2f}" for f, _p in pts] + [f"{p:.1f}" for _f, p in pts]
+                self.line.emit(f"$SC,{self.s_test},{arg},{len(pts)}," + ",".join(vals))
+        self.s_reply = []
+
+        if t < self.s_next:
+            return
+        fast = self.ss not in (0, 6)
+        self.s_next = t + (0.2 if fast else 0.5)
+        rel = int((t - self.s_t0) * 1000) if self.s_t0 is not None and self.ss in (3, 4, 5, 7) else 0
+        tb = t - self.s_t0 if self.s_t0 is not None and self.ss in (4, 5) else -1.0
+        dt = 0.2 if fast else 0.5
+        fs = [self._stand_force(tb - dt * (9 - i) / 10) if self.ss in (4, 5) else 0.0 for i in range(10)]
+        fs = [f + (0.15 * math.sin(t * 13 + i)) for i, f in enumerate(fs)]
+        flags = 0x01 | 0x02 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400
+        flags |= (0x04 | 0x08) if self.ss == 4 else 0
+        flags |= 0x10 if self.ss in (3, 4, 5, 7) else 0
+        flags |= 0x800 if self.s_res else 0
+        flags |= 0x1000 if self.s_hang else 0
+        flags |= 0x4000 if self.s_buzz else 0
+        flags |= 0x8000 if self.s_tared else 0
+        p = fs[-1] * 1.6
+        t1 = 22.0 + (min(40.0, (t - self.s_t0) * 14) if self.s_t0 is not None and self.ss in (4, 5) else 0)
+        prog = int(min(100, (t - self.s_t) / 1.2 * 100)) if self.ss == 1 else (int(min(100, rel / 300)) if rel > 0 else 0)
+        seq, rc = self.s_ack
+        vals = [-61, "9.5", self.ss, self.s_faults, flags, seq, rc, "8.02", "4.99", rel] + [f"{f:.2f}" for f in fs] + \
+               [f"{max(fs):.2f}", f"{p:.1f}", f"{p:.1f}", f"{t1:.1f}", "24.0", self.s_test, 91, prog, 2000, self.s_ch, 1]
+        self.line.emit("$ST," + ",".join(str(v) for v in vals))
+        if self.sp and self.sp[3]:
+            s2, name, _a, _ = self.sp
+            self.line.emit(f"$U,{s2},{name},2,ACK,{rc},1")
+            self.sp = None

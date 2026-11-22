@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-GROUND STATION — one window for both rockets
+GROUND STATION — one window for both rockets and the motor test stand
 
     ZENITH   Sapphire rocket, Zenith v2.4 flight computer
     ARIADNA  Daidalos landing rocket, Ariadna V2 avionics
+    STAND    the rampa alone as a static-fire thrust stand ("TEST MOTORU"):
+             live thrust / chamber pressure / temperatures, ARM + FIRE,
+             results and the thrust curve of every test (gs_stand.py)
 
 Plug the ground station (Pico 2 W + Ra-02 + OLED, firmware/Ground_Station)
 into the laptop and pick the rocket at the top of the window. The choice is
@@ -14,6 +17,7 @@ station's left button for 3 s switches it too, and the window follows.
     pip install -r requirements.txt
     python ground_station.py                    # pick the port in the window
     python ground_station.py --port COM7 --rocket ARIADNA
+    python ground_station.py --rocket STAND --demo   # simulated thrust stand
     python ground_station.py --demo             # no hardware: simulated station + flight
 
 Every line from the station is written to <Documents>/GroundStation/logs.
@@ -33,6 +37,7 @@ from PyQt6.QtCore import Qt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gs_protocol as gp  # noqa: E402
 import gs_widgets as gw  # noqa: E402
+import gs_stand  # noqa: E402
 from gs_widgets import Tile, Strip, CheckRow, StripChart, TiltView, badge, kbutton, panel, caption, set_level  # noqa: E402
 
 try:
@@ -150,7 +155,7 @@ class GroundStation(QtWidgets.QMainWindow):
         self.user_dir = gw.user_dir()
         self._open_log()
 
-        self.setWindowTitle("Pozemní stanice – Zenith / Ariadna")
+        self.setWindowTitle("Pozemní stanice – Zenith / Ariadna / test motoru")
         self.resize(1480, 900)
         self._build()
         self._apply_rocket(initial=True)
@@ -187,7 +192,8 @@ class GroundStation(QtWidgets.QMainWindow):
         grp = QtWidgets.QButtonGroup(self)
         grp.setExclusive(True)
         for key, txt, tip in (("ZENITH", "ZENITH · Sapphire", "Raketa Sapphire s letovým počítačem Zenith v2.4"),
-                              ("ARIADNA", "ARIADNA · Daidalos", "Přistávací raketa Daidalos s avionikou Ariadna V2")):
+                              ("ARIADNA", "ARIADNA · Daidalos", "Přistávací raketa Daidalos s avionikou Ariadna V2"),
+                              ("STAND", "TEST MOTORU · tah", "Rampa bez rakety jako zkušební stav motoru: zážeh, tah, tlak, teploty")):
             b = kbutton(txt, "", tip + " – přepne i pozemní stanici")
             b.setObjectName("Rocket")
             b.setCheckable(True)
@@ -256,10 +262,14 @@ class GroundStation(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
-        v.addWidget(self.tabs, 1)
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self.tabs)
+        v.addWidget(self.stack, 1)
         self._build_flight()
         self._build_start()
         self._build_diag()
+        self.stand = gs_stand.StandPanel(self)       # MODE STAND replaces the rocket tabs
+        self.stack.addWidget(self.stand)
 
         self.narrator = gw.Narrator(self)
         if not self.narrator.available:
@@ -534,6 +544,13 @@ class GroundStation(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(400, lambda p=pad: self.map.set_pad(*p))
         self.state_banner.setText("BEZ DAT")
         set_level(self.state_banner, "idle")
+        stand = self.key == "STAND"
+        self.stack.setCurrentIndex(1 if stand else 0)
+        self.stand.reset()
+        self.win_badge.setToolTip("Test motoru: povely jdou hned po telemetrii rampy (bez RX oken)" if stand else
+                                  "Raketa poslouchá 300 ms každých 10 s (+ poslední okno pro ABORT v T−1 s)")
+        self.abort_btn.setToolTip("Okamžitě pošle ABORT rampě (Ctrl+Shift+A)" if stand else
+                                  "Okamžitě zařadí ABORT do nejbližšího RX okna rakety (Ctrl+Shift+A)")
         if not initial:
             self._open_log()
 
@@ -692,6 +709,8 @@ class GroundStation(QtWidgets.QMainWindow):
                 set_level(self.ul_lb, level)
                 self.note(txt)
                 self._on_uplink(p[2], what, gp.to_int(p[5]))
+                if self.key == "STAND":
+                    self.stand.on_uplink(p[2], what, gp.to_int(p[5]))
             return
         if tag.startswith("#"):
             self.note(s)
@@ -709,8 +728,14 @@ class GroundStation(QtWidgets.QMainWindow):
             self.ch_acc.add(tt, acc=snap.acc_g)
             self.ch_rssi.add(tt, rssi=snap.rssi, **{"snr×5": (snap.snr or 0) * 5})
             self._on_telemetry(snap)
+            if self.key == "STAND":
+                self.stand.on_telemetry(now)
         elif tag in ("$B", "$AS"):
             self.raw_lb.setText(s)
+        elif tag == "$SR" and self.key == "STAND":
+            self.stand.on_result()
+        elif tag == "$SC" and self.key == "STAND":
+            self.stand.on_curve()
 
     def _on_uplink(self, name: str, what: str, rc: int):
         if what == "QUEUED":
@@ -810,7 +835,11 @@ class GroundStation(QtWidgets.QMainWindow):
             if lost != self._los:
                 self.narrator.say("Signal lost" if lost else "Signal regained", urgent=lost)
                 self._los = lost
-        if s.win_in is not None and s.age < 30:
+        if self.key == "STAND":
+            self.win_badge.setText("povely ihned" + (" · příkaz čeká na potvrzení" if st.pending else ""))
+            set_level(self.win_badge, "warn" if st.pending else "info")
+            self.stand.refresh()
+        elif s.win_in is not None and s.age < 30:
             w = s.win_in
             if s.win_final and w > -0.35:
                 self.win_badge.setText(f"⚠ T−1 s ABORT OKNO za {max(0.0, w):.1f} s")
@@ -1042,7 +1071,7 @@ class GroundStation(QtWidgets.QMainWindow):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port")
-    ap.add_argument("--rocket", choices=["ZENITH", "ARIADNA", "zenith", "ariadna"])
+    ap.add_argument("--rocket", choices=["ZENITH", "ARIADNA", "STAND", "zenith", "ariadna", "stand"])
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--demo-speed", type=float, default=1.0, help="simulated time runs this many times faster")
     ap.add_argument("--screenshot", help="save a screenshot after --seconds and quit")

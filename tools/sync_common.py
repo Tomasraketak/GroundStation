@@ -5,6 +5,7 @@ The two wire formats are owned by the rocket repositories:
 
     zenith_link.h   Zenith-flight-computer/firmware/common/
     ariadna_link.h  Daidalos_Landing_Rocket_Code/Ariadna_V2/common/
+    stand_link.h    RampaCode/Rampa_MCU/            (rampa as a thrust stand)
 
 firmware/common holds this repository's copy and firmware/Ground_Station a
 second one (the Arduino builder does not follow "../common").
@@ -28,6 +29,7 @@ SKETCH = os.path.join(ROOT, "firmware", "Ground_Station")
 UPSTREAM = {
     "zenith_link.h": os.path.join(ROOT, "..", "Zenith-flight-computer", "firmware", "common", "zenith_link.h"),
     "ariadna_link.h": os.path.join(ROOT, "..", "Daidalos_Landing_Rocket_Code", "Ariadna_V2", "common", "ariadna_link.h"),
+    "stand_link.h": os.path.join(ROOT, "..", "RampaCode", "Rampa_MCU", "stand_link.h"),
 }
 
 

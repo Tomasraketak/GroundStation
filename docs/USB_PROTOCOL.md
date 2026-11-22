@@ -2,16 +2,17 @@
 
 GUI je jen klient tohoto protokolu – vše jde dělat i ze Serial Monitoru Arduino IDE.
 
-## Režim (raketa)
+## Režim (raketa / test motoru)
 
 | Řádek | Popis |
 |---|---|
-| `MODE` | dotaz → `$MODE,ZENITH` nebo `$MODE,ARIADNA` |
-| `MODE ZENITH` / `MODE ARIADNA` | přepne raketu (aliasy `SAPPHIRE`/`Z`, `DAIDALOS`/`A`), uloží do flash, odpoví `$MODE,…` a `#OK MODE …` |
+| `MODE` | dotaz → `$MODE,ZENITH`, `$MODE,ARIADNA` nebo `$MODE,STAND` |
+| `MODE ZENITH` / `MODE ARIADNA` / `MODE STAND` | přepne režim (aliasy `SAPPHIRE`/`Z`, `DAIDALOS`/`A`, `MOTOR`/`THRUST`/`TRUST`/`TAH`/`S`), uloží do flash, odpoví `$MODE,…` a `#OK MODE …` |
 
 Přepnutí zruší čekající příkaz (`$U,…,CANCELLED`), zahodí zámek RX okna i poslední telemetrii a
-přeladí LoRa (jediný rozdíl na vzduchu je sync word: Zenith `0x2B`, Ariadna `0x12`).
-Stejně funguje podržení levého tlačítka stanice 3 s – stanice pak sama pošle `$MODE`.
+přeladí LoRa (jediný rozdíl na vzduchu je sync word: Zenith a STAND `0x2B`, Ariadna `0x12`; STAND se
+od Zenithu liší vlastními pakety `stand_link.h`).
+Stejně funguje podržení levého tlačítka stanice 3 s (ZENITH → ARIADNA → STAND → ZENITH) – stanice pak sama pošle `$MODE`.
 
 ## Výstup
 
@@ -25,10 +26,14 @@ Stejně funguje podržení levého tlačítka stanice 3 s – stanice pak sama p
 | `$B,…` | ZENITH | beacon rampy bez rakety: rssi, snr, state, flags, t_ms, vbat_V, umb_ma, cont1..3_mV, next_rx_ms, faults, last_ul_seq, last_ul_rc, fw |
 | `$AT,…` | ARIADNA | rssi, snr, t_ms, lat, lon, alt_m, vz, vh, acc_g, qx, qy, qz (int16 „smallest three“), tvc_x, tvc_y [°], thrust_N, t_event_ds (−32768 = neznámo), version, state, nav_phase, clamp_pct, vbat_V, curr_A, hdop, sats, pyro, health, flags, events, uwb, t_flight_s, px_m, py_m |
 | `$AS,…` | ARIADNA | sync / ACK / rampa: rssi, snr, rocket_t_ms, utc_ms (−1 = neznámo), next_rx_ms, rx_dur_ms, t_launch_rem_ms, last_cmd_seq, last_cmd_rc, rampa_state, rampa_flags, rampa_fault, sync_flags, rampa_vbat_mV |
+| `$ST,…` | STAND | telemetrie rampy jako zkušebního stavu: rssi, snr, state (`sl_state_t`: 0 SAFE, 1 ARMING, 2 ARMED, 3 COUNTDOWN, 4 FIRING, 5 BURN, 6 ABORT, 7 RECORD), faults (`SL_FLT_*`), flags (`SL_F_*`), ack_seq, ack_rc, vbat_V, v5_V, t_rel_ms (< 0 do T-0), 10× tah (nejstarší první, rovnoměrně od minulého paketu; N, bez kalibrace µV/V), špička tahu, tlak psi, špička tlaku, T1, T2 °C (`nan` = nepřipojeno), test_no, flash volno %, průběh %, vzorků/s, rozbuška, kontinuita (bit0–2) |
+| `$SR,…` | STAND | výsledek testu: test_no, flags (`SL_RF_*`), rozbuška, špička, impulz, hoření s, průměrný tah, čas špičky, zpoždění zážehu, max. tlak psi, max. T1, T2, bodů křivky, Hz křivky, vzorků na flash, vzorků/s, index T-0 v křivce (−1 bez zážehu) |
+| `$SC,test,offset,n,f1..fn,p1..pn` | STAND | kus 100 Hz křivky (tah, tlak psi) na `CMD CURVE <offset>` |
 | `#OK …` / `#ERR …` | oba | odpověď |
 
-Bitové masky viz `firmware/common/zenith_link.h` (`ZL_TF_*`, `ZL_HL_*`, `ZL_RMP_*`, `ZL_RMPF_*`) a
-`firmware/common/ariadna_link.h` (`ARIADNA_HLT_*`, `ARIADNA_TF_*`, `ARIADNA_TUWB_*`, `ARIADNA_SYNCF_*`).
+Bitové masky viz `firmware/common/zenith_link.h` (`ZL_TF_*`, `ZL_HL_*`, `ZL_RMP_*`, `ZL_RMPF_*`),
+`firmware/common/ariadna_link.h` (`ARIADNA_HLT_*`, `ARIADNA_TF_*`, `ARIADNA_TUWB_*`, `ARIADNA_SYNCF_*`) a
+`firmware/common/stand_link.h` (`SL_F_*`, `SL_FLT_*`, `SL_RF_*`). V režimu STAND má `$U` dest `2`.
 
 ## Příkazy
 
@@ -67,3 +72,27 @@ jiným příkazem.
 * **ARIADNA:** příkazy starého Daidalos `ground_visualizer.py` (`T:1`, `T:0`, `UTC:<ms>`,
   `CMD:PING|PREP|ABORT|PADREF|DISARM|REBOOT[:t]|CD:<s>[:ch]`) stanici přepnou na ARIADNA a zapnou
   binární rámce `ARIADNA_PKT_TELEMETRY` / `ARIADNA_PKT_GS_SYNC`, které starý visualizer čte.
+
+## Režim STAND (rampa jako zkušební stav motoru)
+
+`CMD <NAME> [arg] [arg2]`:
+
+| NAME | Argumenty | Rampa |
+|---|---|---|
+| `PING` | – | heartbeat (stanice ho posílá sama ~2,5 Hz; ve `$U` se neukazuje) |
+| `ARM` | rozbuška 1–3, [puls 50–5000 ms] | ověří blokování, smaže místo pro záznam → ARMED |
+| `DISARM` (`SAFE`) | – | zpět do SAFE, zruší zablokovaný ABORT |
+| `FIRE` (`COUNTDOWN`, `CD`) | odpočet 3–60 s | jen z ARMED: odpočet na rampě, záznam od T-3 s, zážeh v T-0 |
+| `ABORT` | – | kdykoli; nejde přepsat jiným příkazem |
+| `TARE` / `PZERO` | – | nula tahu / tlaku |
+| `CAL` | známá síla v N (stanice posílá mN) | měřítko tenzometru |
+| `RECORD` (`REC`) / `STOP` | s / – | zkušební záznam bez pyro / konec záznamu |
+| `RECTIME` | 2–120 s | délka záznamu po T-0 (uloží se v rampě) |
+| `RESULT` / `CURVE` | – / první bod | znovu `$SR` / jeden `$SC` (16 bodů) |
+| `BUZZER` (`LOCATE`) | 0 / 1 | bzučák rampy |
+
+Nejsou RX okna: rampa poslouchá vždy, když nevysílá. Stanice pošle čekající příkaz 6 ms po každém paketu
+rampy a opakuje ho, dokud ho telemetrie nepotvrdí (`ack_seq` + `ack_rc`: 1 OK, 2 špatný stav, 3 blokování,
+4 argument, 5 přerušeno, 6 zaneprázdněno); po 12 odesláních / 8 s `FAILED`. Když rampu 1,5 s neslyší,
+vysílá naslepo (PING à 700 ms – tím rampu probudí do režimu test motoru; ABORT à 300 ms, 15 s). `CURVE`
+potvrzuje sám paket křivky. Rampa duplicitní `seq` neprovede dvakrát.

@@ -1,11 +1,14 @@
 // =====================================================================
-//  GROUND STATION — one firmware for both rockets
+//  GROUND STATION — one firmware for both rockets and the motor test stand
 //
 //      ZENITH   (Zenith v2.4 flight computer, "Sapphire" rocket)
 //      ARIADNA  (Ariadna V2 avionics, "Daidalos" landing rocket)
+//      STAND    (the rampa PCB alone as a static-fire thrust stand:
+//                igniter, thrust, chamber pressure, 2 temperatures)
 //
-//  The rocket is chosen at run time — from the GUI (USB "MODE ZENITH" /
-//  "MODE ARIADNA") or by holding the left button for 3 s — and remembered
+//  The mode is chosen at run time — from the GUI (USB "MODE ZENITH" /
+//  "MODE ARIADNA" / "MODE STAND") or by holding the left button for 3 s
+//  (cycles ZENITH -> ARIADNA -> STAND) — and remembered
 //  in flash, so the station comes back in the same mode after a power
 //  cycle and works without a laptop. No recompiling, no reflashing.
 //
@@ -17,7 +20,7 @@
 //    LoRa Ra-02  SPI1: MISO GP12, CS GP11, SCK GP14, MOSI GP15, RST GP20, DIO0 GP21
 //    OLED SSD1306 0x3C  I2C0: SDA GP4, SCL GP5 (400 kHz)
 //    Buttons (active HIGH, 10k pull-downs):
-//      BL GP3   short: next OLED page        hold 3 s: switch rocket ZENITH <-> ARIADNA
+//      BL GP3   short: next OLED page        hold 3 s: next mode ZENITH -> ARIADNA -> STAND
 //      BC GP6   hold 1.5 s: ABORT (works without the laptop)
 //      BR GP10  hold 2 s: reboot the station
 //
@@ -39,13 +42,19 @@
 //      ARIADNA  rx  ariadna_tlm_t 50 B (10 Hz)
 //                   ariadna_lora_sync_t 28 B (1-2 Hz on the ground: window, ACK, rampa)
 //               tx  ariadna_lora_uplink_t 20 B
+//      STAND    rx  sl_tlm_t 56 B (2 / 5 Hz), sl_res_t 52 B, sl_curve_t 74 B
+//               tx  sl_cmd_pkt_t 14 B — no windows: sent right after a TLM (the
+//                   rampa listens whenever it is not transmitting), PING as a
+//                   heartbeat (the rampa aborts a countdown without one),
+//                   blind repeats when the rampa is not heard (ABORT every 300 ms)
 //
 //  ---------------------------------------------------------------------
 //  USB (115200, text lines "\r\n") — docs/USB_PROTOCOL.md
 //    out  $ID  $MODE  $G (1 Hz)  $U (uplink status)  #OK / #ERR
 //         ZENITH : $T telemetry, $B rampa beacon   (= the Zenith GS protocol)
 //         ARIADNA: $AT telemetry, $AS sync/ACK/rampa
-//    in   HELLO | MODE [ZENITH|ARIADNA] | CMD <NAME> [arg] [arg2|RAMPA]
+//         STAND  : $ST telemetry, $SR results, $SC curve chunk (+ $B rampa beacon)
+//    in   HELLO | MODE [ZENITH|ARIADNA|STAND] | CMD <NAME> [arg] [arg2|RAMPA]
 //         CANCEL | TEST 0|1 | UTC <ms of day> | LEGACY 0|1
 //
 //  Backward compatible: in ZENITH mode the old gui/ground_station_gui.py of
@@ -67,8 +76,9 @@
 #include "pico/critical_section.h"
 #include "zenith_link.h"
 #include "ariadna_link.h"
+#include "stand_link.h"
 
-#define GS_FW_VERSION  200          // 2.00: one firmware, Zenith + Ariadna
+#define GS_FW_VERSION  300          // 3.00: + STAND (thrust stand on the rampa)
 
 // The two radio set-ups may only differ in the sync word. If either header
 // changes its modulation the station must learn it, so stop the build.
@@ -76,6 +86,8 @@ static_assert(ZL_LORA_FREQ_HZ == ARIADNA_LORA_FREQ_HZ, "frequency differs");
 static_assert(ZL_LORA_SF == ARIADNA_LORA_SF && ZL_LORA_BW_HZ == ARIADNA_LORA_BW_HZ &&
               ZL_LORA_CR4 == ARIADNA_LORA_CR4 && ZL_LORA_PREAMBLE == ARIADNA_LORA_PREAMBLE,
               "modulation differs");
+static_assert(SL_LORA_FREQ_HZ == ZL_LORA_FREQ_HZ && SL_LORA_SF == ZL_LORA_SF && SL_LORA_BW_HZ == ZL_LORA_BW_HZ &&
+              SL_LORA_CR4 == ZL_LORA_CR4 && SL_LORA_PREAMBLE == ZL_LORA_PREAMBLE, "stand modulation differs");
 static_assert(ZL_WIN_PERIOD_MS == ARIADNA_LORA_WIN_PERIOD_MS && ZL_WIN_DUR_MS == ARIADNA_LORA_WIN_DUR_MS,
               "TDMA window differs");
 
@@ -92,8 +104,8 @@ static const int BTN_L = 3, BTN_C = 6, BTN_R = 10;
 static Adafruit_SSD1306 s_oled(128, 64, &Wire, -1);
 
 // ---------------------------------------------------------------- mode
-enum : uint8_t { MODE_ZENITH = 0, MODE_ARIADNA = 1 };
-static const char *MODE_NAME[2] = { "ZENITH", "ARIADNA" };
+enum : uint8_t { MODE_ZENITH = 0, MODE_ARIADNA = 1, MODE_STAND = 2, MODE_COUNT = 3 };
+static const char *MODE_NAME[MODE_COUNT] = { "ZENITH", "ARIADNA", "STAND" };
 static uint8_t s_mode = MODE_ZENITH;
 
 #define EE_MAGIC  0x47u
@@ -103,6 +115,12 @@ static uint8_t s_mode = MODE_ZENITH;
 static const char *ZST_NAME[ZS_COUNT] = { "BOOT", "IDLE", "READY", "CDOWN", "BOOST", "COAST", "DROGUE", "MAIN", "LANDED", "ABORT", "DIAG" };
 static const char *AST_NAME[12] = { "BOOT", "IDLE", "ARM", "ASCENT", "APOGEE", "DESC", "GUIDE", "LANDED", "RECOV", "ABORT", "TEST", "ERROR" };
 static const char *RS_NAME[8] = { "OFF", "IDLE", "READY", "CDOWN", "COMMIT", "FIRED", "ABORT", "FAULT" };
+static const char *SL_NAME[SL_ST_COUNT] = { "SAFE", "ARMING", "ARMED", "CDOWN", "FIRE!", "BURN", "ABORT", "REC" };
+
+// STAND command vocabulary (CMD <NAME> ... in MODE STAND)
+static const char *SL_CMD_NAME[SL_C_COUNT] = { "PING", "ARM", "DISARM", "FIRE", "ABORT", "TARE", "RECORD", "STOP",
+                                               "RESULT", "CURVE", "BUZZER", "RECTIME", "CAL", "PZERO" };
+#define UL_DEST_STAND  2u
 
 // One command vocabulary for both rockets (the Zenith numbering, which is
 // the superset). ARIADNA maps the ones it knows, see ariadna_cmd().
@@ -149,6 +167,17 @@ static ariadna_tlm_t       s_atlm = {};
 static ariadna_lora_sync_t s_async = {};
 static uint32_t            s_atlm_ms = 0, s_async_ms = 0;
 static uint32_t            s_atlm_dt = 0;  // ms between the last two telemetry packets
+// STAND
+static sl_tlm_t            s_stlm = {};
+static sl_res_t            s_sres = {};
+static uint32_t            s_stlm_ms = 0, s_sres_ms = 0, s_srx_ms = 0;   // srx = any packet of the rampa
+static bool                s_stx_due = false;     // the rampa just transmitted: our turn
+static uint32_t            s_stx_ms = 0;          // our last transmission
+static uint32_t            s_sping_ms = 0;
+struct StandPending {
+    bool active; uint8_t seq, cmd; int32_t arg; uint16_t arg2; uint8_t sent; uint32_t queued_ms;
+};
+static StandPending s_sul = {};
 
 // PC time (UTC ms of day) — the ARIADNA fallback window grid when the sync
 // packets fade, and the clock the Ariadna rocket adopts when it has no GPS.
@@ -190,6 +219,7 @@ struct Disp {
     uint32_t rx_ok;
     int32_t  win_in;
     zl_tlm_t zt; zl_rampa_beacon_t zb; uint32_t zt_age, zb_age;
+    sl_tlm_t st; sl_res_t sr; uint32_t st_age, sr_age; uint8_t spcmd; bool spend;
     ariadna_tlm_t at; ariadna_lora_sync_t as; uint32_t at_age, as_age, at_dt;
     uint32_t mode_changed_ms;
 };
@@ -254,6 +284,39 @@ static void emit_async(const ariadna_lora_sync_t &s)
         out_frame(ARIADNA_PKT_GS_SYNC, &g, sizeof g);
     }
 }
+static void fmt_t(char *b, size_t n, int16_t dc) { if (dc == SL_T_NONE) snprintf(b, n, "nan"); else snprintf(b, n, "%.1f", dc * 0.1); }
+static void emit_stlm(const sl_tlm_t &t)
+{
+    char f[SL_SUBS * 12 + 4]; size_t k = 0;
+    for (int i = 0; i < SL_SUBS; i++) k += (size_t)snprintf(f + k, sizeof f - k, "%.2f,", (double)sl_funpack(t.f[i], t.fexp));
+    if (k) f[k - 1] = 0;
+    char t1[12], t2[12], p[12], pp[12];
+    fmt_t(t1, sizeof t1, t.t1_dc); fmt_t(t2, sizeof t2, t.t2_dc); fmt_t(p, sizeof p, t.p_dpsi); fmt_t(pp, sizeof pp, t.ppeak_dpsi);
+    out("$ST,%d,%.1f,%u,%u,%u,%u,%u,%.2f,%.2f,%ld,%s,%.2f,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u",
+        s_rssi, (double)s_snr, t.state, t.faults, t.flags, t.ack_seq, t.ack_rc, t.vbat_mv * 0.001, t.v5_mv * 0.001,
+        (long)t.t_rel_ms, f, (double)sl_funpack(t.fpeak, t.fexp), p, pp, t1, t2, t.test_no, t.flash_free_pct,
+        t.progress, t.sps, t.pyro & 0x03, (t.pyro >> 4) & 0x07);
+}
+static void emit_sres(const sl_res_t &r)
+{
+    out("$SR,%u,%u,%u,%.3f,%.4f,%.3f,%.3f,%.3f,%.3f,%.2f,%.1f,%.1f,%u,%u,%lu,%u,%d",
+        r.test_no, r.flags, r.pyro_ch, (double)r.peak_n, (double)r.impulse_ns, (double)r.burn_s, (double)r.avg_n,
+        (double)r.t_peak_s, (double)r.ign_delay_s, (double)r.pmax_psi, r.t1max_dc * 0.1, r.t2max_dc * 0.1,
+        r.curve_n, r.curve_hz, (unsigned long)r.n_frames, r.sps, r.t0_idx);
+}
+static void emit_scrv(const sl_curve_t &c)
+{
+    char b[300]; size_t k = 0;
+    k += (size_t)snprintf(b + k, sizeof b - k, "$SC,%u,%u,%u", c.test_no, c.offset, c.n);
+    for (int i = 0; i < c.n && i < SL_CRV_PTS; i++) k += (size_t)snprintf(b + k, sizeof b - k, ",%.2f", (double)sl_funpack(c.f[i], c.fexp));
+    for (int i = 0; i < c.n && i < SL_CRV_PTS; i++) k += (size_t)snprintf(b + k, sizeof b - k, ",%.1f", c.p[i] * 0.1);
+    out("%s", b);
+}
+static void sul_status(const char *what, uint8_t rc = 0)
+{
+    if (s_sul.cmd == SL_C_PING) return;
+    out("$U,%u,%s,%u,%s,%u,%u", s_sul.seq, s_sul.cmd < SL_C_COUNT ? SL_CMD_NAME[s_sul.cmd] : "?", UL_DEST_STAND, what, rc, s_sul.sent);
+}
 static void ul_status(const char *what, uint8_t rc = 0)
 {
     out("$U,%u,%s,%u,%s,%u,%u", s_ul.seq, s_ul.cmd < ZL_UL_COUNT ? CMD_NAME[s_ul.cmd] : "?", s_ul.dest, what, rc, s_ul.tries);
@@ -269,8 +332,8 @@ static void radio_config(void)
     LoRa.setSignalBandwidth(ZL_LORA_BW_HZ);
     LoRa.setCodingRate4(ZL_LORA_CR4);
     LoRa.setPreambleLength(ZL_LORA_PREAMBLE);
-    LoRa.setSyncWord(s_mode == MODE_ZENITH ? ZL_LORA_SYNCWORD : ARIADNA_LORA_SYNCWORD);
-    LoRa.setTxPower(s_mode == MODE_ZENITH ? ZL_LORA_TX_DBM : ARIADNA_LORA_TX_DBM);
+    LoRa.setSyncWord(s_mode == MODE_ZENITH ? ZL_LORA_SYNCWORD : s_mode == MODE_STAND ? SL_LORA_SYNCWORD : ARIADNA_LORA_SYNCWORD);
+    LoRa.setTxPower(s_mode == MODE_ZENITH ? ZL_LORA_TX_DBM : s_mode == MODE_STAND ? SL_LORA_TX_DBM : ARIADNA_LORA_TX_DBM);
     LoRa.enableCrc();
     LoRa.receive();
 }
@@ -278,7 +341,9 @@ static void radio_config(void)
 static void reset_link_state(void)
 {
     if (s_ul.active) ul_status("CANCELLED");
-    s_ul = {};
+    if (s_sul.active) sul_status("CANCELLED");
+    s_ul = {}; s_sul = {};
+    s_stlm = {}; s_sres = {}; s_stlm_ms = s_sres_ms = s_srx_ms = 0; s_stx_due = false;
     s_win_valid = false; s_win_final = false;
     s_ztlm = {}; s_zbcn = {}; s_ztlm_ms = s_zbcn_ms = 0;
     s_atlm = {}; s_async = {}; s_atlm_ms = s_async_ms = 0; s_atlm_dt = 0;
@@ -287,7 +352,7 @@ static void reset_link_state(void)
 
 static void set_mode(uint8_t m, bool persist)
 {
-    if (m > MODE_ARIADNA) return;
+    if (m >= MODE_COUNT) return;
     const bool changed = (m != s_mode);
     if (changed) {
         reset_link_state();
@@ -423,6 +488,119 @@ static void check_ack(uint8_t seq, uint8_t rc, uint8_t dest)
     }
 }
 
+// ---------------------------------------------------------------- STAND uplink
+static void stand_queue(uint8_t cmd, int32_t arg, uint16_t arg2)
+{
+    static uint8_t sseq = 0;                          // own counter: the rampa's dedup is separate
+    sseq = (uint8_t)(sseq + 1); if (!sseq) sseq = 1;
+    s_sul = {};
+    s_sul.active = true; s_sul.seq = sseq; s_sul.cmd = cmd; s_sul.arg = arg; s_sul.arg2 = arg2; s_sul.queued_ms = millis();
+    sul_status("QUEUED");
+}
+
+static void stand_tx(uint32_t now)
+{
+    sl_cmd_pkt_t c = {};
+    c.seq = s_sul.seq; c.cmd = s_sul.cmd; c.arg = s_sul.arg; c.arg2 = s_sul.arg2; c.token = sl_token_for(s_sul.cmd);
+    sl_seal(&c, sizeof c, SL_CMD_MAGIC);
+    if (LoRa.beginPacket()) { LoRa.write((const uint8_t *)&c, sizeof c); LoRa.endPacket(false); }
+    LoRa.receive();
+    s_stx_ms = now;
+    if (s_sul.sent < 255) s_sul.sent++;
+}
+
+/**
+ * STAND: no windows. The rampa listens whenever it is not transmitting, so a
+ * command goes out right after one of its packets (s_stx_due), or blind when
+ * it has not been heard for a while. Every command (also PING) is the
+ * heartbeat that keeps a countdown alive on the rampa.
+ */
+static void stand_uplink_service(uint32_t now)
+{
+    if (!s_lora_ok) return;
+    const bool heard = s_srx_ms && (uint32_t)(now - s_srx_ms) < 1500u;
+    if (s_sul.active) {
+        const bool abort = s_sul.cmd == SL_C_ABORT;
+        const uint32_t age = now - s_sul.queued_ms;
+        if (s_sul.sent >= (abort ? 40 : 12) || age > (abort ? 15000u : 8000u)) {
+            sul_status("FAILED"); s_sul.active = false; return;
+        }
+    }
+    bool go = false;
+    if (s_stx_due && (uint32_t)(now - s_srx_ms) >= 6u) {           // right after the rampa's packet
+        s_stx_due = false;
+        go = true;
+    } else if (!heard) {
+        const uint32_t gap = (s_sul.active && s_sul.cmd == SL_C_ABORT) ? 300u : 700u;
+        go = (uint32_t)(now - s_stx_ms) >= gap;                     // blind: wakes the rampa / reaches it anyway
+    }
+    if (!go) return;
+    if (!s_sul.active) {
+        if ((uint32_t)(now - s_sping_ms) < 380u) return;            // heartbeat ~2.5 Hz
+        s_sping_ms = now;
+        stand_queue(SL_C_PING, 0, 0);
+    }
+    stand_tx(now);
+    if (s_sul.cmd == SL_C_PING) s_sul.active = false;               // a ping needs no answer
+    else sul_status(s_sul.sent > 1 ? "SENT2" : "SENT");
+}
+
+static void stand_ack(uint8_t seq, uint8_t rc)
+{
+    if (s_sul.active && s_sul.sent && seq == s_sul.seq && rc != SL_RC_NONE) {
+        sul_status("ACK", rc);
+        s_sul.active = false;
+    }
+}
+
+static int stand_cmd_index(const char *n)
+{
+    for (int i = 0; i < SL_C_COUNT; i++) if (!strcasecmp(n, SL_CMD_NAME[i])) return i;
+    if (!strcasecmp(n, "NOP")) return SL_C_PING;
+    if (!strcasecmp(n, "SAFE")) return SL_C_DISARM;
+    if (!strcasecmp(n, "COUNTDOWN") || !strcasecmp(n, "CD")) return SL_C_FIRE;
+    if (!strcasecmp(n, "REC")) return SL_C_RECORD;
+    if (!strcasecmp(n, "LOCATE")) return SL_C_BUZZER;
+    return -1;
+}
+
+/** CMD <name> [a2] [a3] in MODE STAND. */
+static void stand_handle_cmd(const char *name, const char *a2, const char *a3, uint32_t now)
+{
+    const int c = stand_cmd_index(name);
+    if (c < 0) { out("#ERR unknown STAND command %s (PING ARM DISARM FIRE ABORT TARE RECORD STOP RESULT CURVE BUZZER RECTIME CAL PZERO)", name); return; }
+    if (s_sul.active && s_sul.cmd == SL_C_ABORT && c != SL_C_ABORT) { out("#ERR abort pending"); return; }
+    int32_t arg = a2 ? (int32_t)atol(a2) : 0;
+    uint16_t arg2 = 0;
+    switch (c) {
+    case SL_C_ARM:
+        if (arg < 1 || arg > 3) { out("#ERR ARM <igniter 1-3> [pulse ms %d-%d]", SL_FIRE_MS_MIN, SL_FIRE_MS_MAX); return; }
+        if (a3) { const long ms = atol(a3); if (ms < SL_FIRE_MS_MIN || ms > SL_FIRE_MS_MAX) { out("#ERR pulse %d-%d ms", SL_FIRE_MS_MIN, SL_FIRE_MS_MAX); return; } arg2 = (uint16_t)ms; }
+        break;
+    case SL_C_FIRE:
+        if (arg < SL_CD_MIN_S || arg > SL_CD_MAX_S) { out("#ERR FIRE <countdown %d-%d s>", SL_CD_MIN_S, SL_CD_MAX_S); return; }
+        break;
+    case SL_C_RECORD:
+        if (arg < 1 || arg > SL_REC_MAX_S) { out("#ERR RECORD <1-%d s>", SL_REC_MAX_S); return; }
+        break;
+    case SL_C_RECTIME:
+        if (arg < SL_REC_MIN_S || arg > SL_REC_MAX_S) { out("#ERR RECTIME <%d-%d s>", SL_REC_MIN_S, SL_REC_MAX_S); return; }
+        break;
+    case SL_C_CAL: {
+        const double n = a2 ? atof(a2) : 0;
+        if (n <= 0 || n > 2000000) { out("#ERR CAL <known force N>"); return; }
+        arg = (int32_t)(n * 1000.0 + 0.5);
+        break; }
+    case SL_C_CURVE:
+        if (arg < 0) arg = 0;
+        break;
+    default: break;
+    }
+    stand_queue((uint8_t)c, arg, arg2);
+    out("#OK queued %s seq %u", SL_CMD_NAME[c], s_sul.seq);
+    (void)now;
+}
+
 // ---------------------------------------------------------------- serial commands
 static int cmd_index(const char *n)
 {
@@ -438,12 +616,15 @@ static int parse_mode(const char *s)
 {
     if (!strcasecmp(s, "ZENITH") || !strcasecmp(s, "SAPPHIRE") || !strcasecmp(s, "Z")) return MODE_ZENITH;
     if (!strcasecmp(s, "ARIADNA") || !strcasecmp(s, "DAIDALOS") || !strcasecmp(s, "A")) return MODE_ARIADNA;
+    if (!strcasecmp(s, "STAND") || !strcasecmp(s, "MOTOR") || !strcasecmp(s, "THRUST") || !strcasecmp(s, "TRUST") ||
+        !strcasecmp(s, "TAH") || !strcasecmp(s, "S")) return MODE_STAND;
     return -1;
 }
 
 /** CMD <name> [a2] [a3] for the current rocket. */
 static void handle_cmd(const char *name, const char *a2, const char *a3, uint32_t now)
 {
+    if (s_mode == MODE_STAND) { stand_handle_cmd(name, a2, a3, now); return; }
     const int c = cmd_index(name);
     if (c < 0) { out("#ERR unknown command %s", name); return; }
     if (s_ul.active && s_ul.cmd == ZL_UL_ABORT && c != ZL_UL_ABORT) { out("#ERR abort pending"); return; }
@@ -510,7 +691,7 @@ static void serial_line(char *l, uint32_t now)
     if (!strcasecmp(a0, "MODE")) {
         if (!a1) { emit_mode(); return; }
         const int m = parse_mode(a1);
-        if (m < 0) { out("#ERR MODE ZENITH|ARIADNA"); return; }
+        if (m < 0) { out("#ERR MODE ZENITH|ARIADNA|STAND"); return; }
         set_mode((uint8_t)m, true);
         out("#OK MODE %s", MODE_NAME[s_mode]);
         return;
@@ -522,9 +703,13 @@ static void serial_line(char *l, uint32_t now)
         if (u < 86400000u) { s_utc_base = u; s_utc_ref = now; s_utc_valid = true; }
         return;
     }
-    if (!strcasecmp(a0, "CANCEL")) { if (s_ul.active) ul_status("CANCELLED"); s_ul.active = false; out("#OK CANCEL"); return; }
+    if (!strcasecmp(a0, "CANCEL")) {
+        if (s_ul.active) ul_status("CANCELLED");
+        if (s_sul.active) sul_status("CANCELLED");
+        s_ul.active = false; s_sul.active = false; out("#OK CANCEL"); return;
+    }
     if (!strcasecmp(a0, "CMD") && a1) { handle_cmd(a1, a2, a3, now); return; }
-    out("#ERR HELLO | MODE [ZENITH|ARIADNA] | CMD <name> [arg] [arg2|RAMPA] | CANCEL | TEST 0|1 | UTC <ms> | LEGACY 0|1");
+    out("#ERR HELLO | MODE [ZENITH|ARIADNA|STAND] | CMD <name> [arg] [arg2|RAMPA] | CANCEL | TEST 0|1 | UTC <ms> | LEGACY 0|1");
 }
 
 // ---------------------------------------------------------------- test generators
@@ -617,16 +802,74 @@ static void test_ariadna(uint32_t now)
     }
 }
 
+static void test_stand(uint32_t now)
+{
+    static uint32_t next = 0;
+    if ((int32_t)(now - next) < 0) return;
+    next = now + SL_TLM_FAST_MS;
+    const float c = fmodf(now * 0.001f, 30.0f);
+    sl_tlm_t t = {};
+    t.state = c < 10 ? SL_ST_ARMED : c < 15 ? SL_ST_COUNTDOWN : c < 16 ? SL_ST_FIRING : c < 22 ? SL_ST_BURN : SL_ST_SAFE;
+    t.flags = SL_F_KEY | SL_F_CONT | SL_F_ADS_OK | SL_F_FLASH_OK | SL_F_LC_CAL | SL_F_TH1 | SL_F_TH2 | SL_F_PRESS | SL_F_TARED;
+    if (t.state == SL_ST_FIRING) t.flags |= SL_F_ARM_OUT | SL_F_FIRE_OUT;
+    if (t.state >= SL_ST_COUNTDOWN && t.state <= SL_ST_BURN) t.flags |= SL_F_REC;
+    t.vbat_mv = 8050; t.v5_mv = 4998;
+    t.t_rel_ms = (t.state >= SL_ST_COUNTDOWN && t.state <= SL_ST_BURN) ? (int32_t)((c - 15.0f) * 1000) : 0;
+    float fmax = 0, fv[SL_SUBS];
+    for (int i = 0; i < SL_SUBS; i++) {
+        const float tb = c - 15.0f - (SL_SUBS - 1 - i) * 0.02f;
+        fv[i] = (tb > 0.2f && tb < 3.2f) ? 180.0f * (tb < 0.5f ? (tb - 0.2f) / 0.3f : 1.0f - (tb - 0.5f) * 0.15f) : 0.0f;
+        if (fv[i] > fmax) fmax = fv[i];
+    }
+    t.fexp = sl_fexp_for(fmax);
+    for (int i = 0; i < SL_SUBS; i++) t.f[i] = sl_fpack(fv[i], t.fexp);
+    t.fpeak = sl_fpack(fmax, t.fexp);
+    t.p_dpsi = (int16_t)(fv[SL_SUBS - 1] * 18.0f); t.ppeak_dpsi = t.p_dpsi;
+    t.t1_dc = (int16_t)(215 + (c > 15 ? (c - 15) * 40 : 0)); t.t2_dc = 228;
+    t.test_no = 7; t.flash_free_pct = 93; t.progress = 0; t.sps = 2000; t.pyro = 0x01 | 0x10;
+    t.ack_seq = s_sul.seq; t.ack_rc = SL_RC_OK;
+    s_rssi = -62; s_snr = 9.0f;
+    s_stlm = t; s_stlm_ms = now;
+    emit_stlm(t);
+}
+
 // ---------------------------------------------------------------- receive
 static void receive(void)
 {
     const int sz = LoRa.parsePacket();
     if (sz <= 0) return;
-    uint8_t b[64]; int k = 0;
+    uint8_t b[96]; int k = 0;                     // largest: sl_curve_t 74 B
     while (LoRa.available() && k < (int)sizeof b) b[k++] = (uint8_t)LoRa.read();
     while (LoRa.available()) LoRa.read();
     const uint32_t rx = millis();
     s_rssi = LoRa.packetRssi(); s_snr = LoRa.packetSnr();
+
+    if (s_mode == MODE_STAND) {
+        sl_curve_t cv;
+        if (sl_check(b, (size_t)k, sizeof(sl_tlm_t), SL_TLM_MAGIC)) {
+            memcpy(&s_stlm, b, sizeof s_stlm);
+            s_stlm_ms = s_srx_ms = rx; s_rx_ok++; s_test = false; s_stx_due = true;
+            stand_ack(s_stlm.ack_seq, s_stlm.ack_rc);
+            emit_stlm(s_stlm);
+        } else if (sl_check(b, (size_t)k, sizeof(sl_res_t), SL_RES_MAGIC)) {
+            memcpy(&s_sres, b, sizeof s_sres);
+            s_sres_ms = s_srx_ms = rx; s_rx_ok++; s_stx_due = true;
+            emit_sres(s_sres);
+        } else if (sl_check(b, (size_t)k, sizeof(sl_curve_t), SL_CRV_MAGIC)) {
+            memcpy(&cv, b, sizeof cv);
+            s_srx_ms = rx; s_rx_ok++; s_stx_due = true;
+            if (s_sul.active && s_sul.cmd == SL_C_CURVE && s_sul.sent && cv.offset == (uint16_t)s_sul.arg) stand_ack(s_sul.seq, SL_RC_OK);
+            emit_scrv(cv);
+        } else if (zl_lora_check(b, (size_t)k, sizeof(zl_rampa_beacon_t), ZL_BEACON_MAGIC)) {
+            // the rampa is still a launch pad: our blind PINGs will switch it over
+            memcpy(&s_zbcn, b, sizeof s_zbcn);
+            s_zbcn_ms = rx; s_rx_ok++;
+            emit_zbcn(s_zbcn);
+        } else {
+            s_rx_bad++;
+        }
+        return;
+    }
 
     if (s_mode == MODE_ZENITH) {
         if (zl_lora_check(b, (size_t)k, sizeof(zl_tlm_t), ZL_TLM_MAGIC)) {
@@ -674,7 +917,7 @@ void setup()
     critical_section_init(&s_cs);
 
     EEPROM.begin(256);
-    if (EEPROM.read(0) == EE_MAGIC && EEPROM.read(1) <= MODE_ARIADNA && EEPROM.read(2) == (uint8_t)~EEPROM.read(1))
+    if (EEPROM.read(0) == EE_MAGIC && EEPROM.read(1) < MODE_COUNT && EEPROM.read(2) == (uint8_t)~EEPROM.read(1))
         s_mode = EEPROM.read(1);
 
     SPI1.setRX(LORA_MISO); SPI1.setTX(LORA_MOSI); SPI1.setSCK(LORA_SCK);
@@ -700,23 +943,27 @@ void loop()
         if (c == '\n' || c == '\r') { if (n) { line[n] = 0; serial_line(line, now); n = 0; } }
         else if (n < sizeof(line) - 1) line[n++] = c;
     }
-    if (s_abort_btn) { s_abort_btn = false; queue_cmd(ZL_UL_ABORT, 0, ZL_UL_DEST_ROCKET, now); }
-    if (s_mode_btn)  { s_mode_btn = false; set_mode(s_mode == MODE_ZENITH ? MODE_ARIADNA : MODE_ZENITH, true); }
+    if (s_abort_btn) {
+        s_abort_btn = false;
+        if (s_mode == MODE_STAND) stand_queue(SL_C_ABORT, 0, 0); else queue_cmd(ZL_UL_ABORT, 0, ZL_UL_DEST_ROCKET, now);
+    }
+    if (s_mode_btn)  { s_mode_btn = false; set_mode((uint8_t)((s_mode + 1) % MODE_COUNT), true); }
 
     // ---- radio -----------------------------------------------------------------
     if (s_lora_ok) receive();
-    if (s_test) { if (s_mode == MODE_ZENITH) test_zenith(now); else test_ariadna(now); }
-    uplink_service(now);
+    if (s_test) { if (s_mode == MODE_ZENITH) test_zenith(now); else if (s_mode == MODE_STAND) test_stand(now); else test_ariadna(now); }
+    if (s_mode == MODE_STAND) { if (!s_test) stand_uplink_service(now); }
+    else uplink_service(now);
 
     // ---- station status 1 Hz ----------------------------------------------------
     static uint32_t t_g = 0;
     if ((int32_t)(now - t_g) >= 0) {
         t_g = now + 1000;
-        const uint32_t main_ms = s_mode == MODE_ZENITH ? s_ztlm_ms : s_atlm_ms;
-        const uint32_t aux_ms  = s_mode == MODE_ZENITH ? s_zbcn_ms : s_async_ms;
+        const uint32_t main_ms = s_mode == MODE_ZENITH ? s_ztlm_ms : s_mode == MODE_STAND ? s_stlm_ms : s_atlm_ms;
+        const uint32_t aux_ms  = s_mode == MODE_ZENITH ? s_zbcn_ms : s_mode == MODE_STAND ? s_sres_ms : s_async_ms;
         const int32_t win_in = s_win_valid ? (int32_t)(s_win_open_ms - now) : -1;
         out("$G,%lu,%lu,%ld,%d,%ld,%u,%u,%ld,%s,%d,%d,%d", (unsigned long)s_rx_ok, (unsigned long)s_rx_bad,
-            (long)(main_ms ? (int32_t)(now - main_ms) : -1), s_win_valid, (long)win_in, s_ul.active, s_win_dest,
+            (long)(main_ms ? (int32_t)(now - main_ms) : -1), s_win_valid, (long)win_in, s_mode == MODE_STAND ? s_sul.active : s_ul.active, s_win_dest,
             (long)(aux_ms ? (int32_t)(now - aux_ms) : -1), MODE_NAME[s_mode], s_win_final, s_utc_valid, s_lora_ok);
         if (!s_lora_ok && (now / 1000) % 10 == 0) out("#ERR LoRa init failed");
     }
@@ -733,6 +980,9 @@ void loop()
     d.at_age = s_atlm_ms ? now - s_atlm_ms : 0xFFFFFFFFu;
     d.as_age = s_async_ms ? now - s_async_ms : 0xFFFFFFFFu;
     d.mode_changed_ms = s_mode_changed_ms;
+    d.st = s_stlm; d.sr = s_sres; d.spend = s_sul.active; d.spcmd = s_sul.cmd;
+    d.st_age = s_stlm_ms ? now - s_stlm_ms : 0xFFFFFFFFu;
+    d.sr_age = s_sres_ms ? now - s_sres_ms : 0xFFFFFFFFu;
     critical_section_enter_blocking(&s_cs); s_disp = d; critical_section_exit(&s_cs);
 }
 
@@ -832,6 +1082,46 @@ static void draw_ariadna(const Disp &d, uint8_t page)
     }
 }
 
+static void draw_stand(const Disp &d, uint8_t page)
+{
+    if (d.st_age == 0xFFFFFFFFu) {
+        s_oled.setCursor(0, 16); s_oled.setTextSize(2); s_oled.print("NO STAND"); s_oled.setTextSize(1);
+        s_oled.setCursor(0, 40); s_oled.print(d.zb_age < 5000 ? "rampa heard, waking" : "waiting for rampa");
+        return;
+    }
+    const sl_tlm_t &t = d.st;
+    if (d.st_age > 2000) { s_oled.setCursor(54, 0); s_oled.printf("LOST %lus", (unsigned long)(d.st_age / 1000)); }
+    s_oled.setTextSize(2);
+    s_oled.setCursor(0, 12);
+    if (t.state == SL_ST_COUNTDOWN) s_oled.printf("T-%.1f", (-t.t_rel_ms - (int32_t)d.st_age) * 0.001);
+    else s_oled.printf("%.0fN", (double)sl_funpack(t.f[SL_SUBS - 1], t.fexp));
+    s_oled.setTextSize(1);
+    const char *sn = t.state < SL_ST_COUNT ? SL_NAME[t.state] : "?";
+    s_oled.setCursor(128 - (int)strlen(sn) * 6, 14); s_oled.print(sn);
+    if (page == 0) {
+        s_oled.setCursor(0, 32); s_oled.printf("pk %.0fN p %.0fpsi", (double)sl_funpack(t.fpeak, t.fexp), t.p_dpsi == SL_T_NONE ? 0.0 : t.p_dpsi * 0.1);
+        s_oled.setCursor(0, 42); s_oled.printf("K%d C%d B%.2fV", (t.flags & SL_F_KEY) ? 1 : 0, (t.flags & SL_F_CONT) ? 1 : 0, t.vbat_mv * 0.001);
+        s_oled.setCursor(0, 54);
+        if (t.flags & SL_F_HANGFIRE) s_oled.print("HANGFIRE! STAY AWAY");
+        else if (t.faults) s_oled.printf("faults %02X", t.faults);
+        else s_oled.printf("#%u rec%d %u%%", t.test_no, (t.flags & SL_F_REC) ? 1 : 0, t.progress);
+    } else if (page == 1) {
+        s_oled.setCursor(0, 32);
+        if (t.t1_dc == SL_T_NONE) s_oled.print("T1 --"); else s_oled.printf("T1 %.1fC", t.t1_dc * 0.1);
+        s_oled.setCursor(64, 32);
+        if (t.t2_dc == SL_T_NONE) s_oled.print("T2 --"); else s_oled.printf("T2 %.1fC", t.t2_dc * 0.1);
+        s_oled.setCursor(0, 42); s_oled.printf("%u sps flash %u%%", t.sps, t.flash_free_pct);
+        s_oled.setCursor(0, 54); s_oled.printf("ack %u/%u", t.ack_seq, t.ack_rc);
+    } else {
+        const sl_res_t &r = d.sr;
+        s_oled.setCursor(0, 32);
+        if (d.sr_age == 0xFFFFFFFFu) { s_oled.print("no result yet"); return; }
+        s_oled.printf("#%u pk %.1fN", r.test_no, (double)r.peak_n);
+        s_oled.setCursor(0, 42); s_oled.printf("I %.1fNs %.2fs", (double)r.impulse_ns, (double)r.burn_s);
+        s_oled.setCursor(0, 54); s_oled.printf("pmax %.0fpsi", (double)r.pmax_psi);
+    }
+}
+
 void setup1()
 {
     while (!s_ready) delay(1);
@@ -879,9 +1169,9 @@ void loop1()
     s_oled.setTextColor(SSD1306_WHITE);
 
     if (d.mode_changed_ms && now - d.mode_changed_ms < 1500) {
-        s_oled.setCursor(8, 8); s_oled.print("ROCKET:");
+        s_oled.setCursor(8, 8); s_oled.print("MODE:");
         s_oled.setTextSize(2); s_oled.setCursor(8, 26); s_oled.print(MODE_NAME[d.mode]);
-        s_oled.setTextSize(1); s_oled.setCursor(8, 52); s_oled.print(d.mode == MODE_ZENITH ? "Sapphire" : "Daidalos");
+        s_oled.setTextSize(1); s_oled.setCursor(8, 52); s_oled.print(d.mode == MODE_ZENITH ? "Sapphire" : d.mode == MODE_STAND ? "motor test stand" : "Daidalos");
         s_oled.display();
         return;
     }
@@ -894,13 +1184,13 @@ void loop1()
     // top line: link, mode letter, pending uplink
     s_oled.setCursor(0, 0);
     s_oled.printf("R%d S%.0f #%lu", d.rssi, (double)d.snr, (unsigned long)d.rx_ok);
-    if (d.pend) { s_oled.setCursor(98, 0); s_oled.print("UL"); s_oled.print(d.pcmd); }
-    s_oled.setCursor(122, 0); s_oled.print(d.mode == MODE_ZENITH ? 'Z' : 'A');
+    if (d.mode == MODE_STAND ? d.spend : d.pend) { s_oled.setCursor(98, 0); s_oled.print("UL"); s_oled.print(d.mode == MODE_STAND ? d.spcmd : d.pcmd); }
+    s_oled.setCursor(122, 0); s_oled.print(d.mode == MODE_ZENITH ? 'Z' : d.mode == MODE_STAND ? 'S' : 'A');
 
-    if (d.mode == MODE_ZENITH) draw_zenith(d, page); else draw_ariadna(d, page);
+    if (d.mode == MODE_ZENITH) draw_zenith(d, page); else if (d.mode == MODE_STAND) draw_stand(d, page); else draw_ariadna(d, page);
 
     if (d.test) { s_oled.setCursor(110, 22); s_oled.print("[T]"); }
-    if (d.pend && d.pcmd == ZL_UL_ABORT) {
+    if ((d.mode != MODE_STAND && d.pend && d.pcmd == ZL_UL_ABORT) || (d.mode == MODE_STAND && d.spend && d.spcmd == SL_C_ABORT)) {
         s_oled.fillRect(96, 54, 32, 10, SSD1306_WHITE); s_oled.setTextColor(SSD1306_BLACK);
         s_oled.setCursor(98, 55); s_oled.print("ABRT"); s_oled.setTextColor(SSD1306_WHITE);
     }

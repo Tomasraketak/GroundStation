@@ -5,6 +5,7 @@ The station (firmware/Ground_Station) speaks text lines, docs/USB_PROTOCOL.md:
     common    $ID  $MODE  $G (1 Hz)  $U (uplink)  #OK / #ERR
     ZENITH    $T telemetry, $B rampa beacon          (zenith_link.h)
     ARIADNA   $AT telemetry, $AS sync / ACK / rampa   (ariadna_link.h)
+    STAND     $ST telemetry, $SR results, $SC curve   (stand_link.h, rampa = thrust stand)
 
 A `RocketLink` per rocket keeps the newest raw lines and turns them into one
 normalised snapshot (`Snap`) the window draws without knowing which rocket
@@ -19,7 +20,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-MODES = ("ZENITH", "ARIADNA")
+MODES = ("ZENITH", "ARIADNA", "STAND")
 
 # zl_ul_rc_t / ariadna_ul_rc_t (identical 0..6, Zenith adds 7)
 UL_RC = ["–", "OK", "odmítnuto: raketa letí", "odmítnuto: špatný stav", "odmítnuto: rampa",
@@ -167,6 +168,8 @@ class RocketLink:
 
     def ack_text(self, rc: int) -> str:
         return UL_RC[rc] if 0 <= rc < len(UL_RC) else str(rc)
+
+    OK_RCS = (1, 6)                 # result codes that mean "done as asked"
 
 
 # ================================================================ ZENITH
@@ -574,7 +577,175 @@ class AriadnaLink(RocketLink):
         s.ack_seq, s.ack_rc = to_int(y["last_seq"]), to_int(y["last_rc"])
 
 
-PROFILES = {"ZENITH": ZenithLink, "ARIADNA": AriadnaLink}
+# ================================================================ STAND (rampa = thrust stand)
+SL_STATES = ["SAFE", "ARMING", "ARMED", "COUNTDOWN", "FIRING", "BURN", "ABORT", "RECORD"]
+SL_STATE_CZ = {"SAFE": "zajištěno – pyro vypnuto", "ARMING": "odjišťuji – mažu místo pro záznam",
+               "ARMED": "ODJIŠTĚNO – čeká na povel k zážehu", "COUNTDOWN": "odpočet na rampě, záznam",
+               "FIRING": "ZÁŽEH – proud do rozbušky", "BURN": "motor hoří – záznam běží", "ABORT": "PŘERUŠENO",
+               "RECORD": "zkušební záznam bez zážehu"}
+SL_STATE_TITLE = {"SAFE": "ZAJIŠTĚNO", "ARMING": "ODJIŠŤUJI…", "ARMED": "ODJIŠTĚNO", "COUNTDOWN": "ODPOČET",
+                  "FIRING": "ZÁŽEH", "BURN": "MOTOR HOŘÍ", "ABORT": "PŘERUŠENO", "RECORD": "ZÁZNAM"}
+SL_FAULTS = ["nízká baterie", "klíč vypnut", "rozbuška bez kontinuity", "ztráta spojení se stanicí",
+             "ADS1220 / tenzometr", "flash (chybí / plná)", "tlačítko ABORT", "měřicí jádro / I2C"]
+SL_FLAG = dict(KEY=1 << 0, CONT=1 << 1, ARM_OUT=1 << 2, FIRE_OUT=1 << 3, REC=1 << 4, ADS=1 << 5, FLASH=1 << 6,
+               LC_CAL=1 << 7, TH1=1 << 8, TH2=1 << 9, PRESS=1 << 10, RESULT=1 << 11, HANGFIRE=1 << 12, BTN=1 << 13,
+               BUZZER=1 << 14, TARED=1 << 15)
+SL_RF = dict(FIRED=1, IGNITION=2, ABORTED=4, CURVE=8, SAVED=16, COLD=32, LC_CAL=64)
+SL_RC = ["–", "OK", "odmítnuto: špatný stav", "odmítnuto: blokování (viz chyby)", "odmítnuto: argument",
+         "PŘERUŠENO (ABORT)", "zaneprázdněno – zkus znovu"]
+MOTOR_CLASSES = "ABCDEFGHIJKLMNO"
+
+
+def motor_class(impulse_ns: float, avg_n: float) -> str:
+    """NAR/CAR designation from total impulse, e.g. 'G85' (A = 1.26-2.5 N.s, each letter doubles)."""
+    if not impulse_ns or impulse_ns < 0.3125:
+        return "–"
+    if impulse_ns <= 0.625:
+        letter = "1/4A"
+    elif impulse_ns <= 1.25:
+        letter = "1/2A"
+    else:
+        k = max(0, math.ceil(math.log2(impulse_ns / 2.5)))
+        letter = MOTOR_CLASSES[k] if k < len(MOTOR_CLASSES) else "O+"
+    return f"{letter}{max(0, round(avg_n or 0))}"
+
+
+class StandLink(RocketLink):
+    """The rampa alone as a static-fire thrust stand (MODE STAND)."""
+    KEY = "STAND"
+    TITLE = "TEST MOTORU"
+    SUBTITLE = "rampa · tah, tlak, teploty"
+    TLM_HZ = 5
+    CD_MIN, CD_MAX = 3, 60
+    STATE_NAMES = SL_STATES
+    PAD = {0, 1, 2}
+    FLIGHT = {4, 5}
+    LIFTOFF_STATE = 4
+    ABORT_STATE = 6
+    COMMANDS: list = []
+    STATE_SPEECH = {4: "Ignition", 6: "Abort"}
+    OK_RCS = (1, 5)
+    ST_FIELDS = (["rssi", "snr", "state", "faults", "flags", "ack_seq", "ack_rc", "vbat", "v5", "t_rel_ms"] +
+                 [f"f{i}" for i in range(10)] +
+                 ["fpeak", "p", "ppeak", "t1", "t2", "test_no", "flash_free", "progress", "sps", "ch", "cont"])
+    SR_FIELDS = ["test_no", "flags", "ch", "peak", "impulse", "burn", "avg", "t_peak", "ign_delay", "pmax", "t1max",
+                 "t2max", "curve_n", "curve_hz", "n_frames", "sps", "t0_idx"]
+
+    def track_reset(self):
+        super().track_reset()
+        self.res: dict = {}
+        self.res_rx = 0.0
+        self.b: dict = {}
+        self.b_rx = 0.0
+        self.curve: dict = {}          # test_no -> {offset: (forces, pressures)}
+        self.samples: list = []        # [(pc time, force)] of the latest TLM, oldest first
+        self.prev_rx = 0.0
+
+    def ack_text(self, rc: int) -> str:
+        return SL_RC[rc] if 0 <= rc < len(SL_RC) else str(rc)
+
+    def countdown_cmd(self, seconds, channel=1):
+        return f"FIRE {seconds}"
+
+    def feed(self, tag, p, now):
+        if tag == "$ST" and len(p) >= len(self.ST_FIELDS) + 1:
+            self.t = {k: p[i + 1] for i, k in enumerate(self.ST_FIELDS)}
+            dt = min(0.6, max(0.05, now - self.prev_rx)) if self.prev_rx else 0.2
+            self.prev_rx = self.t_rx = now
+            fs = [to_float(self.t[f"f{i}"]) for i in range(10)]
+            self.samples = [(now - dt * (9 - i) / 10.0, f) for i, f in enumerate(fs)]
+            return True
+        if tag == "$SR" and len(p) >= len(self.SR_FIELDS) + 1:
+            self.res = {k: p[i + 1] for i, k in enumerate(self.SR_FIELDS)}
+            self.res_rx = now
+            return False
+        if tag == "$SC" and len(p) >= 4:
+            test, off, n = to_int(p[1]), to_int(p[2]), to_int(p[3])
+            if len(p) >= 4 + 2 * n:
+                fs = [to_float(x) for x in p[4:4 + n]]
+                ps = [to_float(x) for x in p[4 + n:4 + 2 * n]]
+                self.curve.setdefault(test, {})[off] = (fs, ps)
+            return False
+        if tag == "$B" and len(p) >= len(ZenithLink.B_FIELDS) + 1:
+            self.b = {k: p[i + 1] for i, k in enumerate(ZenithLink.B_FIELDS)}
+            self.b_rx = now
+        return False
+
+    # ---- helpers for the stand panel
+    def flag(self, name: str) -> bool:
+        return bool(to_int(self.t.get("flags")) & SL_FLAG[name]) if self.t else False
+
+    def faults(self) -> list[str]:
+        return bits(to_int(self.t.get("faults")), SL_FAULTS) if self.t else []
+
+    def force_unit(self) -> str:
+        return "N" if self.flag("LC_CAL") else "µV/V"
+
+    def curve_points(self, test: int):
+        """(t_s from T-0, force, pressure) lists of a downloaded curve, or None while incomplete."""
+        r = self.res
+        if not r or to_int(r.get("test_no")) != test:
+            return None
+        n, hz, t0 = to_int(r.get("curve_n")), max(1, to_int(r.get("curve_hz"), 100)), to_int(r.get("t0_idx"), -1)
+        chunks = self.curve.get(test, {})
+        f, pr = [None] * n, [None] * n
+        for off, (fs, ps) in chunks.items():
+            for i, (a, b) in enumerate(zip(fs, ps)):
+                if 0 <= off + i < n:
+                    f[off + i], pr[off + i] = a, b
+        if n == 0 or any(v is None for v in f):
+            return None
+        base = t0 if t0 >= 0 else 0
+        return [(i - base) / hz for i in range(n)], f, pr
+
+    def next_missing(self, test: int) -> int | None:
+        n = to_int(self.res.get("curve_n")) if self.res else 0
+        have = set()
+        for off, (fs, _ps) in self.curve.get(test, {}).items():
+            have.update(range(off, off + len(fs)))
+        for i in range(0, n, 16):
+            if i not in have:
+                return i
+        return None
+
+    def snapshot(self, now):
+        s = Snap(rocket=self.KEY)
+        t = self.t
+        s.age = now - self.t_rx if t else 1e9
+        if not t:
+            if self.b and now - self.b_rx < 15:
+                s.state_name, s.state_cz, s.state_level = "RAMPA ČEKÁ", "rampa slyšet, přepínám ji do režimu test motoru…", "warn"
+                s.rssi, s.snr = to_float(self.b.get("rssi")), to_float(self.b.get("snr"))
+                s.age = now - self.b_rx
+            return s
+        s.have = True
+        st = to_int(t["state"])
+        name = self.state_name(st)
+        s.state = st
+        s.state_name = SL_STATE_TITLE.get(name, name)
+        s.state_cz = SL_STATE_CZ.get(name, "")
+        if self.flag("HANGFIRE") and st == 0:
+            s.state_name, s.state_cz = "NEZAŽEHL!", "rozbuška odpálena, tah nezaznamenán – NEPŘIBLIŽUJ SE (5 min)"
+        s.state_level = ("bad" if st == 6 or (st == 0 and self.flag("HANGFIRE")) else "accent" if st in (4, 5)
+                         else "warn" if st in (1, 2, 3) else "info" if st == 7 else "plain")
+        s.on_pad, s.in_flight = st in self.PAD, st in self.FLIGHT
+        s.rssi, s.snr = to_float(t["rssi"]), to_float(t["snr"])
+        s.vbat = to_float(t["vbat"])
+        rel = to_int(t["t_rel_ms"])
+        if st == 3:
+            s.t_rem = -rel / 1000 - s.age
+        elif st in (4, 5, 7) and rel:
+            s.t_flight = rel / 1000 + s.age
+        s.ack_seq, s.ack_rc = to_int(t["ack_seq"]), to_int(t["ack_rc"])
+        s.armed = st in (2, 3, 4)
+        cont = to_int(t["cont"])
+        s.pyro = [(f"Rozbuška {i + 1}", bool(cont & (1 << i)), False) for i in range(3)]
+        s.rampa_text = f"test motoru · {name}"
+        s.rampa_level = "ok"
+        return s
+
+
+PROFILES = {"ZENITH": ZenithLink, "ARIADNA": AriadnaLink, "STAND": StandLink}
 
 
 # ----------------------------------------------------------------------------
@@ -620,7 +791,7 @@ def parse_uplink(p: list[str], link: RocketLink) -> tuple[str, str, str] | None:
         txt += f" (okno {tries})"
     if what == "ACK":
         txt = "POTVRZENO: " + link.ack_text(rc)
-    level = "ok" if what == "ACK" and rc in (1, 6) else "bad" if what in ("ACK", "FAILED") else "warn"
+    level = "ok" if what == "ACK" and rc in link.OK_RCS else "bad" if what in ("ACK", "FAILED") else "warn"
     return f"#{seq} {name}: {txt}", level, what
 
 
