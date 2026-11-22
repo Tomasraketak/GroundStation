@@ -627,7 +627,7 @@ class StandLink(RocketLink):
     OK_RCS = (1, 5)
     ST_FIELDS = (["rssi", "snr", "state", "faults", "flags", "ack_seq", "ack_rc", "vbat", "v5", "t_rel_ms"] +
                  [f"f{i}" for i in range(10)] +
-                 ["fpeak", "p", "ppeak", "t1", "t2", "test_no", "flash_free", "progress", "sps", "ch", "cont"])
+                 ["fpeak", "p", "ppeak", "t1", "t2", "test_no", "flash_free", "progress", "sps", "ch", "cont", "servo"])
     SR_FIELDS = ["test_no", "flags", "ch", "peak", "impulse", "burn", "avg", "t_peak", "ign_delay", "pmax", "t1max",
                  "t2max", "curve_n", "curve_hz", "n_frames", "sps", "t0_idx"]
 
@@ -677,6 +677,10 @@ class StandLink(RocketLink):
 
     def faults(self) -> list[str]:
         return bits(to_int(self.t.get("faults")), SL_FAULTS) if self.t else []
+
+    def servo_arming(self) -> bool:
+        """The rampa closes the second arming switch with a servo at ARM (key sense open until then)."""
+        return bool(to_int(self.t.get("servo")) & 1) if self.t else False
 
     def force_unit(self) -> str:
         return "N" if self.flag("LC_CAL") else "µV/V"

@@ -290,7 +290,7 @@ class StandPanel(QtWidgets.QWidget):
         self.manual = []
         for text in ("Motor pevně upevněn na stojanu, tryska míří do bezpečného prostoru",
                      "Prostor vyklizen, všichni za bezpečnou vzdáleností / krytem",
-                     "Rozbuška zapojena až teď, klíč rampy zapnut",
+                     "Rozbuška zapojena až teď, klíč rampy zapnut (servo spínač sepne rampa při ARM)",
                      "Hasicí přístroj připraven, vedoucí testu dal souhlas"):
             cb = QtWidgets.QCheckBox(text)
             cb.toggled.connect(lambda _on: self.refresh())
@@ -591,7 +591,9 @@ class StandPanel(QtWidgets.QWidget):
             ("Spojení s rampou", "ok" if fresh else "bad",
              (f"paket před {age:.1f} s · {gp.to_float(t.get('rssi')):.0f} dBm" if t else
               ("rampa slyšet, přepínám ji…" if L.b else "bez spojení – rampa zapnutá, bez rakety?")) if connected else "stanice nepřipojena"),
-            ("Klíč rampy (pyro napájení)", "ok" if L.flag("KEY") else "bad", "zapnut" if L.flag("KEY") else "VYPNUT"),
+            ("Klíč rampy (pyro napájení)", "ok" if L.flag("KEY") or (L.servo_arming() and st in (0, 1)) else "bad",
+             ("sepnut" + (" (klíč + servo)" if L.servo_arming() else "")) if L.flag("KEY") else
+             ("druhý spínač sepne servo při ARM – lidský klíč zapni u rampy" if L.servo_arming() and st in (0, 1) else "VYPNUT")),
             (f"Rozbuška {ch} – kontinuita", "ok" if cont & (1 << (ch - 1)) else "bad",
              "OK" if cont & (1 << (ch - 1)) else "BEZ KONTINUITY" + (f" (OK je na {', '.join(str(i + 1) for i in range(3) if cont & (1 << i))})" if cont else "")),
             ("Baterie rampy", "ok" if t and gp.to_float(t.get("vbat")) >= 7.2 else "warn" if t and gp.to_float(t.get("vbat")) >= 6.6 else "bad",

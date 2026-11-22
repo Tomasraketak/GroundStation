@@ -292,10 +292,10 @@ static void emit_stlm(const sl_tlm_t &t)
     if (k) f[k - 1] = 0;
     char t1[12], t2[12], p[12], pp[12];
     fmt_t(t1, sizeof t1, t.t1_dc); fmt_t(t2, sizeof t2, t.t2_dc); fmt_t(p, sizeof p, t.p_dpsi); fmt_t(pp, sizeof pp, t.ppeak_dpsi);
-    out("$ST,%d,%.1f,%u,%u,%u,%u,%u,%.2f,%.2f,%ld,%s,%.2f,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u",
+    out("$ST,%d,%.1f,%u,%u,%u,%u,%u,%.2f,%.2f,%ld,%s,%.2f,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%u",
         s_rssi, (double)s_snr, t.state, t.faults, t.flags, t.ack_seq, t.ack_rc, t.vbat_mv * 0.001, t.v5_mv * 0.001,
         (long)t.t_rel_ms, f, (double)sl_funpack(t.fpeak, t.fexp), p, pp, t1, t2, t.test_no, t.flash_free_pct,
-        t.progress, t.sps, t.pyro & 0x03, (t.pyro >> 4) & 0x07);
+        t.progress, t.sps, t.pyro & 0x03, (t.pyro >> 4) & 0x07, (t.pyro >> 2) & 0x03);   // servo: bit0 configured, bit1 armed
 }
 static void emit_sres(const sl_res_t &r)
 {

@@ -462,7 +462,7 @@ static void t_stand()
     v = lines();
     const std::string ST = find(v, "$ST,");
     auto f = split(ST);
-    CHECK(f.size() == 32, "$ST has 31 fields (%zu)", f.size() - 1);
+    CHECK(f.size() == 33, "$ST has 32 fields (%zu)", f.size() - 1);
     CHECK(f.size() > 11 && f[11] == "123.40" && f[22] == "250.0" && f[24] == "25.1" && f[25] == "nan", "$ST values: force %s psi %s T1 %s T2 %s",
           f.size() > 25 ? f[11].c_str() : "", f.size() > 25 ? f[22].c_str() : "", f.size() > 25 ? f[24].c_str() : "", f.size() > 25 ? f[25].c_str() : "");
     CHECK(LoRa.tx.size() == 1 && sent_cmd(0, c) && c.cmd == SL_C_PING, "heartbeat PING after the TLM");

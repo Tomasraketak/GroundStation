@@ -469,7 +469,7 @@ class DemoStation(QtCore.QObject):
         dt = 0.2 if fast else 0.5
         fs = [self._stand_force(tb - dt * (9 - i) / 10) if self.ss in (4, 5) else 0.0 for i in range(10)]
         fs = [f + (0.15 * math.sin(t * 13 + i)) for i, f in enumerate(fs)]
-        flags = 0x01 | 0x02 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400
+        flags = (0x01 if self.ss in (2, 3, 4) else 0) | 0x02 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400
         flags |= (0x04 | 0x08) if self.ss == 4 else 0
         flags |= 0x10 if self.ss in (3, 4, 5, 7) else 0
         flags |= 0x800 if self.s_res else 0
@@ -481,7 +481,7 @@ class DemoStation(QtCore.QObject):
         prog = int(min(100, (t - self.s_t) / 1.2 * 100)) if self.ss == 1 else (int(min(100, rel / 300)) if rel > 0 else 0)
         seq, rc = self.s_ack
         vals = [-61, "9.5", self.ss, self.s_faults, flags, seq, rc, "8.02", "4.99", rel] + [f"{f:.2f}" for f in fs] + \
-               [f"{max(fs):.2f}", f"{p:.1f}", f"{p:.1f}", f"{t1:.1f}", "24.0", self.s_test, 91, prog, 2000, self.s_ch, 1]
+               [f"{max(fs):.2f}", f"{p:.1f}", f"{p:.1f}", f"{t1:.1f}", "24.0", self.s_test, 91, prog, 2000, self.s_ch, 1, 1 | (2 if self.ss in (2, 3, 4) else 0)]
         self.line.emit("$ST," + ",".join(str(v) for v in vals))
         if self.sp and self.sp[3]:
             s2, name, _a, _ = self.sp
