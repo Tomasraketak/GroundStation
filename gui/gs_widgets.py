@@ -105,6 +105,9 @@ QPushButton[kind="go"] {{ background: {t['ok']}; color: #ffffff; border-color: {
 QPushButton[kind="warn"] {{ background: {t['warn']}; color: #000000; border-color: #8a5d00; }}
 QPushButton[kind="danger"] {{ color: {t['bad']}; border-color: {t['bad']}; }}
 QPushButton[kind="primary"] {{ color: {t['info']}; border-color: {t['info']}; }}
+QPushButton[kind="abort"]:disabled, QPushButton[kind="go"]:disabled, QPushButton[kind="warn"]:disabled,
+QPushButton[kind="primary"]:disabled, QPushButton[kind="danger"]:disabled {{
+    background: {t['idle']}; color: {t['dim']}; border-color: {t['grid']}; }}
 QPushButton#Rocket {{ font-size: 15px; padding: 6px 16px; }}
 QPushButton#Rocket:checked {{ background: {t['accent']}; color: #ffffff; border-color: {t['accent']}; }}
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit {{ background: {t['panel']}; border: 1px solid {t['border']};
@@ -266,9 +269,10 @@ class StripChart(QtWidgets.QWidget):
     """Rolling time chart, several series, grid and labels. No pyqtgraph needed."""
 
     def __init__(self, title: str, series: list[tuple[str, str]], span_s: float = 120.0, unit: str = "",
-                 floor: float | None = None):
+                 floor: float | None = None, min_span: float = 0.0):
         super().__init__()
         self.title, self.series, self.span, self.unit, self.floor = title, series, span_s, unit, floor
+        self.min_span = min_span          # smallest y range shown (keeps sensor noise from filling the chart)
         self.data = {name: deque(maxlen=8000) for name, _ in series}
         self.setMinimumHeight(140)
 
@@ -310,6 +314,9 @@ class StripChart(QtWidgets.QWidget):
             hi = max(hi, self.floor + 10)
         if hi - lo < 1e-6:
             hi, lo = hi + 1, lo - 1
+        if hi - lo < self.min_span:
+            mid = (hi + lo) / 2
+            hi, lo = mid + self.min_span / 2, mid - self.min_span / 2
         pad = (hi - lo) * 0.08
         lo, hi = lo - pad, hi + pad
         if self.floor is not None:

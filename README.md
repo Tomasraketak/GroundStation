@@ -1,8 +1,8 @@
-# Pozemní stanice – Zenith (Sapphire) + Ariadna (Daidalos)
+# Pozemní stanice – Zenith (Sapphire) + Ariadna (Daidalos) + test motoru
 
-Jeden firmware pozemní stanice a jedno GUI pro obě rakety. Raketa se volí **v GUI tlačítkem
-nahoře** (`ZENITH · Sapphire` / `ARIADNA · Daidalos`) – stanice se okamžitě přeladí a volbu si
-pamatuje. Bez změny kódu, bez přeflashování.
+Jeden firmware pozemní stanice a jedno GUI pro obě rakety **a pro statický test motoru na rampě**.
+Režim se volí **v GUI tlačítkem nahoře** (`ZENITH · Sapphire` / `ARIADNA · Daidalos` /
+`TEST MOTORU · tah`) – stanice se okamžitě přeladí a volbu si pamatuje. Bez změny kódu, bez přeflashování.
 
 ## Rychlý start (Windows)
 
@@ -20,7 +20,7 @@ Co se stane (jednou, lze kdykoli spustit znovu):
 
 Každé kliknutí na zástupce **aktualizuje složku `GroundStation` z GitHubu** (vlastní úpravy schová
 do `git stash`, nic nemaže), aktualizuje Python balíčky a **otevře GUI**. Bez internetu spustí to,
-co je na disku. Volitelně s argumentem (`zenith`, `ariadna`, `demo`):
+co je na disku. Volitelně s argumentem (`zenith`, `ariadna`, `stand`, `demo`):
 `powershell -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\GroundStation\gs_launch.ps1" demo`.
 Log: `%LOCALAPPDATA%\GroundStation\launch.log`. Stejný princip jako `zenith_setup.ps1` / `daidalos_setup.ps1`.
 
@@ -28,22 +28,24 @@ Log: `%LOCALAPPDATA%\GroundStation\launch.log`. Stejný princip jako `zenith_set
 > (`git clone https://github.com/Tomasraketak/GroundStation.git "%USERPROFILE%\Desktop\GroundStation"`)
 > a spusť `powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\Desktop\GroundStation\tools\windows\gs_setup.ps1"`.
 
-> **Stav:** firmware se kompiluje (arduino-pico 6.4.0, Pico 2 W i Pico 2) a je otestovaný na PC
+> **Stav:** firmware 2.00 se kompiloval (arduino-pico 6.4.0, Pico 2 W i Pico 2); verze 3.00 (režim STAND) je otestovaná na PC,
+> pro Pico zatím nepřeložená. Vše je otestované na PC
 > simulací rádia; GUI je otestované proti simulované stanici. **Na skutečném hardwaru zatím
 > neběželo** – před ostrým startem projdi [zkoušky](#zkoušky-před-použitím).
 
 | Část | Kde |
 |---|---|
 | Firmware stanice | [`firmware/Ground_Station`](firmware/Ground_Station) – Pico 2 W + Ra-02 + OLED (deska pozemní stanice, stejná pro obě rakety) |
-| Protokoly raket | [`firmware/common`](firmware/common) – `zenith_link.h` (repo Zenith-flight-computer), `ariadna_link.h` (repo Daidalos) |
-| GUI | [`gui/ground_station.py`](gui/ground_station.py) (+ `gs_protocol.py`, `gs_widgets.py`, `gs_demo.py`) |
+| Protokoly | [`firmware/common`](firmware/common) – `zenith_link.h` (repo Zenith-flight-computer), `ariadna_link.h` (repo Daidalos), `stand_link.h` (repo RampaCode – rampa jako zkušební stav) |
+| GUI | [`gui/ground_station.py`](gui/ground_station.py) (+ `gs_protocol.py`, `gs_widgets.py`, `gs_stand.py`, `gs_demo.py`) |
 | USB protokol | [`docs/USB_PROTOCOL.md`](docs/USB_PROTOCOL.md) |
 | Testy | [`test`](test) – firmware na PC (`fw_host_test.cpp`), GUI offscreen (`gui_smoke.py`) |
 
 ```
    Zenith (Sapphire)  433 MHz, sync 0x2B ─┐                       USB, text
    Ariadna (Daidalos) 433 MHz, sync 0x12 ─┼─► pozemní stanice ─────────────► ground_station.py
-   rampa (bez rakety, Zenith beacon) ─────┘   MODE ZENITH | ARIADNA          (volba rakety)
+   rampa (bez rakety, Zenith beacon) ─────┤   MODE ZENITH | ARIADNA | STAND  (volba režimu)
+   rampa = test motoru, sync 0x2B ────────┘
 ```
 
 ## Firmware
@@ -65,7 +67,7 @@ arduino-cli compile -b rp2040:rp2040:rpipico2w firmware/Ground_Station   # Pico 
 
 | Tlačítko | Krátce | Podržet |
 |---|---|---|
-| BL (GP3) | další stránka OLED | **3 s: přepnout raketu ZENITH ↔ ARIADNA** |
+| BL (GP3) | další stránka OLED | **3 s: další režim ZENITH → ARIADNA → STAND** |
 | BC (GP6) | – | **1,5 s: ABORT** |
 | BR (GP10) | – | 2 s: restart stanice |
 
@@ -99,7 +101,17 @@ tlačítkem se stáhnou i pro offline použití na místě); bez něj GUI kresl�
 * Hlasový narátor (odpočet 10/5/3/start, události), světlý („VENKU“) a tmavý („NOC“) vzhled.
 * Každý řádek ze stanice se zapisuje do `Dokumenty\GroundStation\logs`.
 
-Když někdo přepne raketu tlačítkem na stanici, okno ji následuje.
+* **TEST MOTORU** (místo záložek): živý tah, špička, tlak v komoře (psi/bar), dvě teploty, baterie rampy, grafy;
+  automatické kontroly rampy (spojení, klíč, kontinuita zvolené rozbušky, baterie, tenzometr, flash, čidla);
+  nastavení (rozbuška, puls, odpočet, délka záznamu), TARE, nula tlaku, kalibrace závažím, zkušební záznam,
+  bzučák; ruční bezpečnostní body; **① ODJISTIT** (jen když je vše zelené a odškrtnuté) a **② ZAPÁLIT**
+  (potvrzení napsáním `ZAPAL`); ZAJISTIT. Po testu výsledek (špička, impulz, hoření, průměr, **třída motoru**,
+  zpoždění zážehu, max. tlak a teploty), automatické stažení **ořízlého zážehu** (50 Hz, rampa sama najde
+  začátek a konec hoření, ztracené bloky se vyžádají znovu – 10 s zážeh za pár sekund) přes LoRa, graf a CSV do
+  `Dokumenty\GroundStation\stand`. Po odpálení bez tahu velké varování **NEZAŽEHL** s 5min odpočtem.
+  Postup a zapojení: README repa [RampaCode](https://github.com/Tomasraketak/RampaCode#test-motoru-měření-tahu).
+
+Když někdo přepne režim tlačítkem na stanici, okno ho následuje.
 
 ## Testy
 
@@ -108,7 +120,8 @@ make -C test                                            # firmware na PC + kopie
 QT_QPA_PLATFORM=offscreen python3 test/gui_smoke.py     # GUI: let Zenithu i Ariadny přes demo stanici
 ```
 
-`fw_host_test.cpp` přeloží `.ino` na PC proti stubům (LoRa, EEPROM, OLED, USB) a hraje raketu:
+`fw_host_test.cpp` přeloží `.ino` na PC proti stubům (LoRa, EEPROM, OLED, USB) a hraje raketu i rampu (STAND:
+probuzení rampy, heartbeat, ARM/FIRE s tokenem, opakování do ACK, ABORT naslepo, výsledky, křivka, `FAILED`):
 přepínání režimu (USB, tlačítko, staré příkazy) a jeho uložení, sync word, formát řádků, přesné
 časování obou kopií ABORT/ODPOČET v okně, obsah a CRC uplinku, ACK, opakování a `FAILED`,
 poslední okno T-1 s, náhradní UTC okno Ariadny, binární rámce pro starý visualizer, tlačítko ABORT.
@@ -123,3 +136,5 @@ poslední okno T-1 s, náhradní UTC okno Ariadny, binární rámce pro starý v
 5. Odpojit notebook: OLED, BC 1,5 s = ABORT, BL 3 s = přepnutí rakety.
 6. Starý `ground_visualizer.py` (Daidalos) a starý `ground_station_gui.py` (Zenith), pokud je
    ještě chceš používat.
+7. **TEST MOTORU** s rampou (firmware rampy ≥ 3.00) a **žárovkou místo rozbušky**: probuzení rampy, TARE,
+   ARM, ZAPÁLIT 5 s, ABORT v odpočtu, vypnutí stanice v odpočtu (rampa sama ABORT do 2,5 s), stažení křivky.

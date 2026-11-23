@@ -131,7 +131,7 @@ if (-not (Test-Path $gui)) { Fail "Nenalezeno: $gui" }
 if ($LASTEXITCODE -ne 0) { Fail "V prostredi chybi PyQt6 / pyserial a nejde je stahnout (offline?)." }
 
 $guiArgs = "`"$gui`""
-if ($Arg -eq "zenith" -or $Arg -eq "ariadna") { $guiArgs += " --rocket $($Arg.ToUpper())" }
+if ($Arg -eq "zenith" -or $Arg -eq "ariadna" -or $Arg -eq "stand") { $guiArgs += " --rocket $($Arg.ToUpper())" }
 if ($Arg -eq "demo") { $guiArgs += " --demo" }
 Say "Spoustim pozemni stanici..."
 # Started in <Documents>\GroundStation (logs, map cache) - never in the code

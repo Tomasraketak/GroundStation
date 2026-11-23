@@ -120,7 +120,7 @@ static void t_boot_and_mode()
     CHECK(LoRa.sync_word == ZL_LORA_SYNCWORD, "Zenith sync word 0x%X", LoRa.sync_word);
     usb("HELLO"); step(2);
     auto v = lines();
-    CHECK(find(v, "$ID,") == "$ID,Ground Station,2.00,ZENITH", "ID line '%s'", find(v, "$ID,").c_str());
+    CHECK(find(v, "$ID,") == "$ID,Ground Station,3.00,ZENITH", "ID line '%s'", find(v, "$ID,").c_str());
     CHECK(has(v, "$MODE,ZENITH"), "MODE line");
 
     usb("MODE ARIADNA"); step(2);
@@ -149,7 +149,14 @@ static void t_boot_and_mode()
     for (int i = 0; i < 3200; i++) { g_now++; loop1(); loop(); }
     g_pin[BTN_L] = LOW;
     for (int i = 0; i < 10; i++) { g_now++; loop1(); loop(); }
-    CHECK(s_mode == MODE_ZENITH, "BL hold 3 s switches ARIADNA -> ZENITH");
+    CHECK(s_mode == MODE_STAND && LoRa.sync_word == SL_LORA_SYNCWORD, "BL hold 3 s: ARIADNA -> STAND");
+    for (int i = 0; i < 300; i++) { g_now++; loop1(); loop(); }
+    CHECK(s_oled.screen.find("STAND") != std::string::npos, "OLED shows the new mode: %s", s_oled.screen.c_str());
+    g_pin[BTN_L] = HIGH;
+    for (int i = 0; i < 3200; i++) { g_now++; loop1(); loop(); }
+    g_pin[BTN_L] = LOW;
+    for (int i = 0; i < 10; i++) { g_now++; loop1(); loop(); }
+    CHECK(s_mode == MODE_ZENITH, "BL hold 3 s again: STAND -> ZENITH");
     for (int i = 0; i < 300; i++) { g_now++; loop1(); loop(); }
     CHECK(s_oled.screen.find("ZENITH") != std::string::npos, "OLED shows the new rocket: %s", s_oled.screen.c_str());
     lines();
@@ -414,6 +421,174 @@ static void t_abort_button()
     CHECK(has(lines(), "#ERR abort pending"), "a pending ABORT is not replaced");
 }
 
+static sl_tlm_t stlm(uint8_t state = SL_ST_SAFE, uint8_t ack_seq = 0, uint8_t ack_rc = 0)
+{
+    sl_tlm_t t = {};
+    t.state = state; t.flags = SL_F_KEY | SL_F_ADS_OK | SL_F_LC_CAL; t.vbat_mv = 8000; t.v5_mv = 5000;
+    t.fexp = 1; for (int i = 0; i < SL_SUBS; i++) t.f[i] = sl_fpack(123.4f, 1);
+    t.fpeak = sl_fpack(130.0f, 1); t.p_dpsi = 2500; t.ppeak_dpsi = 2600; t.t1_dc = 251; t.t2_dc = SL_T_NONE;
+    t.ack_seq = ack_seq; t.ack_rc = ack_rc; t.test_no = 3; t.sps = 2000; t.pyro = 0x21;
+    sl_seal(&t, sizeof t, SL_TLM_MAGIC);
+    return t;
+}
+static bool sent_cmd(size_t i, sl_cmd_pkt_t &c)
+{
+    if (i >= LoRa.tx.size()) return false;
+    const auto &b = LoRa.tx[i].b;
+    if (!sl_check(b.data(), b.size(), sizeof c, SL_CMD_MAGIC)) return false;
+    memcpy(&c, b.data(), sizeof c);
+    return true;
+}
+
+static void t_stand()
+{
+    printf("== STAND: thrust stand on the rampa\n");
+    usb("MODE MOTOR"); step(2);
+    auto v = lines();
+    CHECK(s_mode == MODE_STAND && has(v, "$MODE,STAND") && LoRa.sync_word == SL_LORA_SYNCWORD, "MODE MOTOR -> STAND, sync 0x%X", LoRa.sync_word);
+    CHECK(EEPROM.mem[1] == MODE_STAND, "STAND persisted");
+    reset_tx();
+    step(1600);
+    sl_cmd_pkt_t c{};
+    CHECK(LoRa.tx.size() >= 2 && sent_cmd(0, c) && c.cmd == SL_C_PING, "rampa not heard: blind PINGs wake it (%zu)", LoRa.tx.size());
+    CHECK(LoRa.tx.size() >= 2 && LoRa.tx[1].t_ms - LoRa.tx[0].t_ms >= 690, "blind PING every 700 ms");
+    v = lines();
+    CHECK(!contains(v, "PING"), "PINGs do not flood the USB");
+
+    // telemetry -> $ST, the station answers right after it
+    step(400); reset_tx();
+    sl_tlm_t t = stlm();
+    air(&t, sizeof t); step(20);
+    v = lines();
+    const std::string ST = find(v, "$ST,");
+    auto f = split(ST);
+    CHECK(f.size() == 33, "$ST has 32 fields (%zu)", f.size() - 1);
+    CHECK(f.size() > 11 && f[11] == "123.40" && f[22] == "250.0" && f[24] == "25.1" && f[25] == "nan", "$ST values: force %s psi %s T1 %s T2 %s",
+          f.size() > 25 ? f[11].c_str() : "", f.size() > 25 ? f[22].c_str() : "", f.size() > 25 ? f[24].c_str() : "", f.size() > 25 ? f[25].c_str() : "");
+    CHECK(LoRa.tx.size() == 1 && sent_cmd(0, c) && c.cmd == SL_C_PING, "heartbeat PING after the TLM");
+    if (!LoRa.tx.empty()) CHECK(LoRa.tx[0].t_ms - (g_now - 19) >= 6 && LoRa.tx[0].t_ms - (g_now - 19) <= 9, "6 ms after the TLM");
+
+    // ARM: validated, sent after the next TLM, ACKed by the TLM after that
+    usb("CMD ARM 5"); step(1);
+    CHECK(has(lines(), "#ERR ARM"), "ARM 5 refused (igniter 1-3)");
+    usb("CMD ARM 2 1500"); step(1);
+    v = lines();
+    CHECK(has(v, "$U,") && contains(v, ",ARM,2,QUEUED"), "ARM queued");
+    reset_tx();
+    t = stlm(); air(&t, sizeof t); step(20);
+    CHECK(sent_cmd(0, c) && c.cmd == SL_C_ARM && c.arg == 2 && c.arg2 == 1500 && c.token == SL_TOK_ARM, "ARM 2 / 1500 ms sent with token");
+    v = lines();
+    CHECK(contains(v, ",ARM,2,SENT,"), "SENT reported");
+    const uint8_t arm_seq = c.seq;
+    t = stlm(SL_ST_ARMING, arm_seq, SL_RC_OK); air(&t, sizeof t); step(20);
+    v = lines();
+    CHECK(contains(v, ",ARM,2,ACK,1,"), "ACK rc 1");
+    CHECK(!s_sul.active, "nothing pending");
+
+    // FIRE: countdown range, retried after every TLM until the ACK
+    usb("CMD FIRE 99"); step(1);
+    CHECK(has(lines(), "#ERR FIRE"), "FIRE 99 s refused");
+    usb("CMD FIRE 10"); step(1); lines();
+    reset_tx();
+    for (int i = 0; i < 3; i++) { t = stlm(SL_ST_ARMED); air(&t, sizeof t); step(200); }
+    int fires = 0; uint8_t fseq = 0;
+    for (size_t i = 0; i < LoRa.tx.size(); i++) if (sent_cmd(i, c) && c.cmd == SL_C_FIRE) { fires++; fseq = c.seq; CHECK(c.arg == 10 && c.token == SL_TOK_FIRE, "FIRE 10 s, token"); }
+    CHECK(fires == 3, "FIRE repeated after each TLM until ACKed (%d)", fires);
+    t = stlm(SL_ST_COUNTDOWN, fseq, SL_RC_OK); t.t_rel_ms = -9000; sl_seal(&t, sizeof t, SL_TLM_MAGIC); air(&t, sizeof t); step(20);
+    v = lines();
+    CHECK(contains(v, ",FIRE,2,ACK,1,"), "FIRE acknowledged");
+
+    // ABORT: rampa silent -> blind every 300 ms; button BC works in STAND
+    reset_tx();
+    step(1600);
+    usb("CMD ABORT"); step(1500);
+    int ab = 0;
+    for (size_t i = 0; i < LoRa.tx.size(); i++) if (sent_cmd(i, c) && c.cmd == SL_C_ABORT) ab++;
+    CHECK(ab >= 4, "rampa not heard: ABORT sent blind every 300 ms (%d)", ab);
+    usb("CMD TARE"); step(1);
+    CHECK(has(lines(), "#ERR abort pending"), "ABORT cannot be replaced");
+    t = stlm(SL_ST_ABORT, s_sul.seq, SL_RC_ABORTED); air(&t, sizeof t); step(20);
+    v = lines();
+    CHECK(contains(v, ",ABORT,2,ACK,5,"), "ABORT ACK rc 5");
+    g_pin[BTN_C] = HIGH;
+    for (int i = 0; i < 1600; i++) { g_now++; loop1(); loop(); }
+    g_pin[BTN_C] = LOW;
+    v = lines();
+    CHECK(contains(v, ",ABORT,2,QUEUED"), "BC held 1.5 s -> STAND ABORT");
+    usb("CANCEL"); step(2); lines();
+
+    // results and curve chunks
+    sl_res_t r = {};
+    r.test_no = 3; r.flags = SL_RF_FIRED | SL_RF_IGNITION | SL_RF_SAVED | SL_RF_CURVE; r.peak_n = 150.5f; r.impulse_ns = 210.25f;
+    r.burn_s = 1.9f; r.curve_n = 400; r.curve_hz = 100; r.t0_idx = 100; r.sps = 2000;
+    sl_seal(&r, sizeof r, SL_RES_MAGIC);
+    air(&r, sizeof r); step(5);
+    v = lines();
+    const std::string SR = find(v, "$SR,");
+    CHECK(SR.compare(0, 23, "$SR,3,27,0,150.500,210.") == 0, "$SR line '%s'", SR.c_str());
+    usb("CMD CURVE 32"); step(1); lines(); reset_tx();
+    t = stlm(); air(&t, sizeof t); step(20);
+    CHECK(sent_cmd(0, c) && c.cmd == SL_C_CURVE && c.arg == 32, "CURVE 32 requested");
+    sl_curve_t cv = {};
+    cv.test_no = 3; cv.offset = 32; cv.n = 16; cv.fexp = 0;
+    for (int i = 0; i < 16; i++) { cv.f[i] = (int16_t)(i * 100); cv.p[i] = (int16_t)(i * 10); }
+    sl_seal(&cv, sizeof cv, SL_CRV_MAGIC);
+    air(&cv, sizeof cv); step(3);
+    v = lines();
+    const std::string SC = find(v, "$SC,");
+    CHECK(split(SC).size() == 4 + 32 && SC.compare(0, 19, "$SC,3,32,16,0.00,10") == 0, "$SC line with 16 + 16 values");
+    CHECK(contains(v, ",CURVE,2,ACK,1,"), "the CURVE packet itself acknowledges the request");
+
+    // cropped burn: BURN request, $SB blocks, no heartbeat inside the burst
+    usb("CMD BURN 0"); step(1); lines(); reset_tx();
+    t = stlm(); air(&t, sizeof t); step(20);
+    CHECK(sent_cmd(0, c) && c.cmd == SL_C_BURN && c.arg == 0 && c.arg2 == 0, "BURN 0 (all blocks) requested");
+    {
+        sl_burn_t bu = {};
+        bu.test_no = 3; bu.idx = 0; bu.n_blocks = 3; bu.n = 40; bu.fexp = 0; bu.rate_hz = 50; bu.flags = 0x1B;
+        bu.t_first_ms = -100; bu.burn_a_ms = 150; bu.burn_b_ms = 2150; bu.t1_dc = 251; bu.t2_dc = SL_T_NONE;
+        for (int i = 0; i < 40; i++) { bu.f[i] = (int16_t)(i * 10); bu.p[i] = (int16_t)(i * 20); }
+        sl_seal(&bu, sizeof bu, SL_BURN_MAGIC);
+        reset_tx();
+        air(&bu, sizeof bu); step(30);
+        v = lines();
+        const std::string SB = find(v, "$SB,");
+        CHECK(split(SB).size() == 12 + 80 && SB.rfind("$SB,3,0,3,40,50,27,-100,150,2150,25.1,nan,0.00,1.00", 0) == 0, "$SB line '%.60s'", SB.c_str());
+        CHECK(contains(v, ",BURN,2,ACK,1,"), "the first block acknowledges BURN");
+        CHECK(LoRa.tx.empty(), "no PING after a burst block (would collide with the next block)");
+        bu.idx = 1; sl_seal(&bu, sizeof bu, SL_BURN_MAGIC);
+        usb("CMD BURN 2 1"); step(1); lines();
+        air(&bu, sizeof bu); step(30);
+        CHECK(sent_cmd(0, c) && c.cmd == SL_C_BURN && c.arg == 2 && c.arg2 == 1, "a pending command (missing block) goes right after a block");
+        lines();
+        usb("CANCEL"); step(2); lines();
+    }
+
+    // CAL in N -> mN on the air
+    usb("CMD CAL 98.0665"); step(1); lines(); reset_tx();
+    t = stlm(); air(&t, sizeof t); step(20);
+    CHECK(sent_cmd(0, c) && c.cmd == SL_C_CAL && c.arg == 98067 && c.token == SL_TOK_CAL, "CAL 98.0665 N -> 98067 mN, token");
+    t = stlm(SL_ST_SAFE, c.seq, SL_RC_OK); air(&t, sizeof t); step(20); lines();
+
+    // no ACK at all -> FAILED
+    usb("CMD TARE"); step(1); lines();
+    for (int i = 0; i < 14; i++) { t = stlm(); air(&t, sizeof t); step(200); }
+    CHECK(contains(lines(), ",TARE,2,FAILED"), "no ACK after 12 sends -> FAILED");
+
+    // the rampa still a launch pad: its Zenith beacon is shown
+    zl_rampa_beacon_t b = {}; b.vbat_mv = 7900; zl_lora_seal(&b, sizeof b, ZL_BEACON_MAGIC);
+    air(&b, sizeof b); step(2);
+    CHECK(has(lines(), "$B,"), "rampa beacon ($B) in STAND mode");
+
+    // test generator
+    usb("TEST 1"); step(1000);
+    v = lines();
+    CHECK(has(v, "$ST,"), "TEST 1 generates $ST");
+    usb("TEST 0"); step(2);
+    usb("MODE ZENITH"); step(2); lines();
+    CHECK(s_mode == MODE_ZENITH && LoRa.sync_word == ZL_LORA_SYNCWORD, "back to ZENITH");
+}
+
 int main()
 {
     t_boot_and_mode();
@@ -427,6 +602,7 @@ int main()
     t_silent_rocket();
     t_test_mode_and_status();
     t_abort_button();
+    t_stand();
     printf("\n%s: %d checks, %d failed\n", g_fail ? "FW HOST TEST FAILED" : "FW HOST TEST PASSED", g_ok + g_fail, g_fail);
     return g_fail ? 1 : 0;
 }
