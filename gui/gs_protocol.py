@@ -590,6 +590,7 @@ SL_FAULTS = ["nízká baterie", "klíč vypnut", "rozbuška bez kontinuity", "zt
 SL_FLAG = dict(KEY=1 << 0, CONT=1 << 1, ARM_OUT=1 << 2, FIRE_OUT=1 << 3, REC=1 << 4, ADS=1 << 5, FLASH=1 << 6,
                LC_CAL=1 << 7, TH1=1 << 8, TH2=1 << 9, PRESS=1 << 10, RESULT=1 << 11, HANGFIRE=1 << 12, BTN=1 << 13,
                BUZZER=1 << 14, TARED=1 << 15)
+SL_T_NOBURN = -2147483648
 SL_RF = dict(FIRED=1, IGNITION=2, ABORTED=4, CURVE=8, SAVED=16, COLD=32, LC_CAL=64)
 SL_RC = ["–", "OK", "odmítnuto: špatný stav", "odmítnuto: blokování (viz chyby)", "odmítnuto: argument",
          "PŘERUŠENO (ABORT)", "zaneprázdněno – zkus znovu"]
@@ -638,6 +639,7 @@ class StandLink(RocketLink):
         self.b: dict = {}
         self.b_rx = 0.0
         self.curve: dict = {}          # test_no -> {offset: (forces, pressures)}
+        self.burn: dict = {}           # test_no -> {"n": blocks, "rate", "t_first", "a", "b", "blocks": {idx: (f, p, t1, t2)}}
         self.samples: list = []        # [(pc time, force)] of the latest TLM, oldest first
         self.prev_rx = 0.0
 
@@ -665,6 +667,17 @@ class StandLink(RocketLink):
                 fs = [to_float(x) for x in p[4:4 + n]]
                 ps = [to_float(x) for x in p[4 + n:4 + 2 * n]]
                 self.curve.setdefault(test, {})[off] = (fs, ps)
+            return False
+        if tag == "$SB" and len(p) >= 12:
+            # $SB,test,idx,n_blocks,n,rate,flags,t_first_ms,burn_a_ms,burn_b_ms,t1,t2,f1..fn,p1..pn
+            test, idx, nb, n = (to_int(x) for x in p[1:5])
+            if len(p) >= 12 + 2 * n:
+                d = self.burn.setdefault(test, {"blocks": {}})
+                d.update(n=nb, rate=max(1, to_int(p[5], 50)), flags=to_int(p[6]), t_first=to_int(p[7]),
+                         a=None if to_int(p[8]) == SL_T_NOBURN else to_int(p[8]),
+                         b=None if to_int(p[9]) == SL_T_NOBURN else to_int(p[9]))
+                d["blocks"][idx] = ([to_float(x) for x in p[12:12 + n]], [to_float(x) for x in p[12 + n:12 + 2 * n]],
+                                    to_float(p[10]), to_float(p[11]))
             return False
         if tag == "$B" and len(p) >= len(ZenithLink.B_FIELDS) + 1:
             self.b = {k: p[i + 1] for i, k in enumerate(ZenithLink.B_FIELDS)}
@@ -701,6 +714,30 @@ class StandLink(RocketLink):
             return None
         base = t0 if t0 >= 0 else 0
         return [(i - base) / hz for i in range(n)], f, pr
+
+    def burn_missing(self, test: int) -> list[int] | None:
+        """Blocks of the cropped burn still missing (None = no block yet, size unknown)."""
+        d = self.burn.get(test)
+        if not d or "n" not in d:
+            return None
+        return [i for i in range(d["n"]) if i not in d["blocks"]]
+
+    def burn_points(self, test: int):
+        """(t_s from T-0, force, pressure, t1, t2) of the complete crop, or None."""
+        d = self.burn.get(test)
+        if not d or self.burn_missing(test) != []:
+            return None
+        t, f, pr, t1, t2 = [], [], [], [], []
+        dt = 1.0 / d["rate"]
+        for k in range(d["n"]):
+            fs, ps, a, b = d["blocks"][k]
+            for i, (x, y) in enumerate(zip(fs, ps)):
+                t.append(d["t_first"] / 1000.0 + (k * 40 + i) * dt)
+                f.append(x)
+                pr.append(y)
+                t1.append(a)
+                t2.append(b)
+        return t, f, pr, t1, t2
 
     def next_missing(self, test: int) -> int | None:
         n = to_int(self.res.get("curve_n")) if self.res else 0

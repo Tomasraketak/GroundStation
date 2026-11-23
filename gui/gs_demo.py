@@ -13,6 +13,7 @@ case heating, results ($SR) and the 100 Hz curve on request ($SC).
 from __future__ import annotations
 
 import math
+import random
 import time
 
 from PyQt6 import QtCore
@@ -290,7 +291,8 @@ class DemoStation(QtCore.QObject):
 
     # ---------------------------------------------------------------- thrust stand (rampa)
     ST_NAMES = ["PING", "ARM", "DISARM", "FIRE", "ABORT", "TARE", "RECORD", "STOP", "RESULT", "CURVE", "BUZZER",
-                "RECTIME", "CAL", "PZERO"]
+                "RECTIME", "CAL", "PZERO", "BURN"]
+    LOSS = 0.15                     # simulated LoRa loss of BURN blocks
     ALIAS = {"SAFE": "DISARM", "COUNTDOWN": "FIRE", "CD": "FIRE", "REC": "RECORD", "LOCATE": "BUZZER", "NOP": "PING"}
 
     def _stand_reset(self):
@@ -304,6 +306,7 @@ class DemoStation(QtCore.QObject):
         self.s_cold = 0.0
         self.s_test = 4
         self.s_res = None
+        self.s_burn = None
         self.s_curve: list = []
         self.s_peak = 0.0
         self.s_hang = False
@@ -390,6 +393,17 @@ class DemoStation(QtCore.QObject):
                 return 2
             self.s_reply.append(("SR", 0))
             return 1
+        if name == "BURN":
+            if not self.s_burn:
+                return 2
+            first = int(a0)
+            nb = self.s_burn["n"]
+            if not 0 <= first < nb:
+                return 4
+            cnt = int(float(args[1])) if len(args) > 1 else 0
+            last = nb - 1 if cnt <= 0 else min(nb - 1, first + cnt - 1)
+            self.s_reply += [("SB", k) for k in range(first, last + 1)]
+            return 1
         if name == "CURVE":
             if not self.s_res:
                 return 2
@@ -414,6 +428,31 @@ class DemoStation(QtCore.QObject):
                       f"{pmax:.2f}", "61.5", "24.0", len(self.s_curve), 100, len(self.s_curve) * 20, 2000,
                       -1 if cold else t0i]
         self.s_hang = fired and not ign
+        # the crop sent by BURN (same rules as the rampa)
+        run, a, b, k = 3, None, None, 0
+        for i in range(t0i, len(self.s_curve)):
+            k = k + 1 if self.s_curve[i][0] > thr else 0
+            if k == run:
+                a = i - run + 1
+                break
+        k = 0
+        for i in range(len(self.s_curve) - 1, (a if a is not None else len(self.s_curve)) - 1, -1):
+            k = k + 1 if self.s_curve[i][0] > thr else 0
+            if k == run:
+                b = i + run - 1
+                break
+        if a is not None and b is not None:
+            ca, cb = max(0, a - 25), min(len(self.s_curve) - 1, b + 50)
+        elif not cold:
+            ca, cb = max(0, t0i - 50), min(len(self.s_curve) - 1, t0i + 300)
+        else:
+            ca, cb = 0, len(self.s_curve) - 1
+        div = 2 if cb - ca + 1 <= 3000 else 5
+        pts = [self.s_curve[j:j + div] for j in range(ca, cb + 1, div)]
+        pts = [(sum(f for f, _ in g) / len(g), sum(q for _, q in g) / len(g)) for g in pts]
+        self.s_burn = dict(n=(len(pts) + 39) // 40, rate=100 // div, pts=pts, t_first=(ca - t0i) * 10,
+                           a=(a - t0i) * 10 if a is not None else -2147483648,
+                           b=(b + 1 - t0i) * 10 if b is not None else -2147483648, flags=flags)
         self.ss, self.s_t, self.s_t0 = 0, t, None
         self.s_reply += [("SR", 0), ("SR", 0)]
 
@@ -454,6 +493,12 @@ class DemoStation(QtCore.QObject):
         for kind, arg in self.s_reply:
             if kind == "SR" and self.s_res:
                 self.line.emit("$SR," + ",".join(str(v) for v in self.s_res))
+            elif kind == "SB" and self.s_burn and random.random() >= self.LOSS:
+                B = self.s_burn
+                blk = B["pts"][arg * 40:(arg + 1) * 40]
+                vals = [f"{f:.2f}" for f, _ in blk] + [f"{q:.1f}" for _, q in blk]
+                self.line.emit(f"$SB,{self.s_test},{arg},{B['n']},{len(blk)},{B['rate']},{B['flags']},{B['t_first']},"
+                               f"{B['a']},{B['b']},31.5,24.0," + ",".join(vals))
             elif kind == "SC" and self.s_res:
                 pts = [(f, p) for f, p in self.s_curve[arg:arg + 16]]
                 vals = [f"{f:.2f}" for f, _p in pts] + [f"{p:.1f}" for _f, p in pts]

@@ -42,7 +42,7 @@
 //      ARIADNA  rx  ariadna_tlm_t 50 B (10 Hz)
 //                   ariadna_lora_sync_t 28 B (1-2 Hz on the ground: window, ACK, rampa)
 //               tx  ariadna_lora_uplink_t 20 B
-//      STAND    rx  sl_tlm_t 56 B (2 / 5 Hz), sl_res_t 52 B, sl_curve_t 74 B
+//      STAND    rx  sl_tlm_t 56 B (2 / 5 Hz), sl_res_t 52 B, sl_curve_t 74 B, sl_burn_t 188 B
 //               tx  sl_cmd_pkt_t 14 B — no windows: sent right after a TLM (the
 //                   rampa listens whenever it is not transmitting), PING as a
 //                   heartbeat (the rampa aborts a countdown without one),
@@ -53,7 +53,7 @@
 //    out  $ID  $MODE  $G (1 Hz)  $U (uplink status)  #OK / #ERR
 //         ZENITH : $T telemetry, $B rampa beacon   (= the Zenith GS protocol)
 //         ARIADNA: $AT telemetry, $AS sync/ACK/rampa
-//         STAND  : $ST telemetry, $SR results, $SC curve chunk (+ $B rampa beacon)
+//         STAND  : $ST telemetry, $SR results, $SC curve chunk, $SB burn block (+ $B rampa beacon)
 //    in   HELLO | MODE [ZENITH|ARIADNA|STAND] | CMD <NAME> [arg] [arg2|RAMPA]
 //         CANCEL | TEST 0|1 | UTC <ms of day> | LEGACY 0|1
 //
@@ -119,7 +119,7 @@ static const char *SL_NAME[SL_ST_COUNT] = { "SAFE", "ARMING", "ARMED", "CDOWN", 
 
 // STAND command vocabulary (CMD <NAME> ... in MODE STAND)
 static const char *SL_CMD_NAME[SL_C_COUNT] = { "PING", "ARM", "DISARM", "FIRE", "ABORT", "TARE", "RECORD", "STOP",
-                                               "RESULT", "CURVE", "BUZZER", "RECTIME", "CAL", "PZERO" };
+                                               "RESULT", "CURVE", "BUZZER", "RECTIME", "CAL", "PZERO", "BURN" };
 #define UL_DEST_STAND  2u
 
 // One command vocabulary for both rockets (the Zenith numbering, which is
@@ -172,6 +172,7 @@ static sl_tlm_t            s_stlm = {};
 static sl_res_t            s_sres = {};
 static uint32_t            s_stlm_ms = 0, s_sres_ms = 0, s_srx_ms = 0;   // srx = any packet of the rampa
 static bool                s_stx_due = false;     // the rampa just transmitted: our turn
+static bool                s_stx_burst = false;   // ... but it was a BURN block: only a real command, no PING
 static uint32_t            s_stx_ms = 0;          // our last transmission
 static uint32_t            s_sping_ms = 0;
 struct StandPending {
@@ -311,6 +312,17 @@ static void emit_scrv(const sl_curve_t &c)
     for (int i = 0; i < c.n && i < SL_CRV_PTS; i++) k += (size_t)snprintf(b + k, sizeof b - k, ",%.2f", (double)sl_funpack(c.f[i], c.fexp));
     for (int i = 0; i < c.n && i < SL_CRV_PTS; i++) k += (size_t)snprintf(b + k, sizeof b - k, ",%.1f", c.p[i] * 0.1);
     out("%s", b);
+}
+static void emit_sburn(const sl_burn_t &b)
+{
+    char t1[12], t2[12];
+    fmt_t(t1, sizeof t1, b.t1_dc); fmt_t(t2, sizeof t2, b.t2_dc);
+    char o[700]; size_t k = 0;
+    k += (size_t)snprintf(o + k, sizeof o - k, "$SB,%u,%u,%u,%u,%u,%u,%ld,%ld,%ld,%s,%s", b.test_no, b.idx, b.n_blocks, b.n,
+                          b.rate_hz, b.flags, (long)b.t_first_ms, (long)b.burn_a_ms, (long)b.burn_b_ms, t1, t2);
+    for (int i = 0; i < b.n && i < SL_BURN_PTS; i++) k += (size_t)snprintf(o + k, sizeof o - k, ",%.2f", (double)sl_funpack(b.f[i], b.fexp));
+    for (int i = 0; i < b.n && i < SL_BURN_PTS; i++) k += (size_t)snprintf(o + k, sizeof o - k, ",%.1f", b.p[i] * 0.1);
+    if (Serial && Serial.availableForWrite() > (int)k + 2) { Serial.print(o); Serial.print("\r\n"); }
 }
 static void sul_status(const char *what, uint8_t rc = 0)
 {
@@ -529,7 +541,8 @@ static void stand_uplink_service(uint32_t now)
     bool go = false;
     if (s_stx_due && (uint32_t)(now - s_srx_ms) >= 6u) {           // right after the rampa's packet
         s_stx_due = false;
-        go = true;
+        go = !s_stx_burst || s_sul.active;                          // inside a burst: no heartbeat
+        if (!go) return;
     } else if (!heard) {
         const uint32_t gap = (s_sul.active && s_sul.cmd == SL_C_ABORT) ? 300u : 700u;
         go = (uint32_t)(now - s_stx_ms) >= gap;                     // blind: wakes the rampa / reaches it anyway
@@ -568,7 +581,7 @@ static int stand_cmd_index(const char *n)
 static void stand_handle_cmd(const char *name, const char *a2, const char *a3, uint32_t now)
 {
     const int c = stand_cmd_index(name);
-    if (c < 0) { out("#ERR unknown STAND command %s (PING ARM DISARM FIRE ABORT TARE RECORD STOP RESULT CURVE BUZZER RECTIME CAL PZERO)", name); return; }
+    if (c < 0) { out("#ERR unknown STAND command %s (PING ARM DISARM FIRE ABORT TARE RECORD STOP RESULT CURVE BURN BUZZER RECTIME CAL PZERO)", name); return; }
     if (s_sul.active && s_sul.cmd == SL_C_ABORT && c != SL_C_ABORT) { out("#ERR abort pending"); return; }
     int32_t arg = a2 ? (int32_t)atol(a2) : 0;
     uint16_t arg2 = 0;
@@ -594,6 +607,11 @@ static void stand_handle_cmd(const char *name, const char *a2, const char *a3, u
     case SL_C_CURVE:
         if (arg < 0) arg = 0;
         break;
+    case SL_C_BURN: {                                               // BURN [first block] [blocks, 0 = all]
+        if (arg < 0 || arg > 254) { out("#ERR BURN [first block 0-254] [count]"); return; }
+        const long n = a3 ? atol(a3) : 0;
+        arg2 = (uint16_t)(n < 0 ? 0 : n > 255 ? 255 : n);
+        break; }
     default: break;
     }
     stand_queue((uint8_t)c, arg, arg2);
@@ -838,7 +856,7 @@ static void receive(void)
 {
     const int sz = LoRa.parsePacket();
     if (sz <= 0) return;
-    uint8_t b[96]; int k = 0;                     // largest: sl_curve_t 74 B
+    uint8_t b[200]; int k = 0;                    // largest: sl_burn_t 188 B
     while (LoRa.available() && k < (int)sizeof b) b[k++] = (uint8_t)LoRa.read();
     while (LoRa.available()) LoRa.read();
     const uint32_t rx = millis();
@@ -848,13 +866,20 @@ static void receive(void)
         sl_curve_t cv;
         if (sl_check(b, (size_t)k, sizeof(sl_tlm_t), SL_TLM_MAGIC)) {
             memcpy(&s_stlm, b, sizeof s_stlm);
-            s_stlm_ms = s_srx_ms = rx; s_rx_ok++; s_test = false; s_stx_due = true;
+            s_stlm_ms = s_srx_ms = rx; s_rx_ok++; s_test = false; s_stx_due = true; s_stx_burst = false;
             stand_ack(s_stlm.ack_seq, s_stlm.ack_rc);
             emit_stlm(s_stlm);
         } else if (sl_check(b, (size_t)k, sizeof(sl_res_t), SL_RES_MAGIC)) {
             memcpy(&s_sres, b, sizeof s_sres);
-            s_sres_ms = s_srx_ms = rx; s_rx_ok++; s_stx_due = true;
+            s_sres_ms = s_srx_ms = rx; s_rx_ok++; s_stx_due = true; s_stx_burst = false;
             emit_sres(s_sres);
+        } else if (sl_check(b, (size_t)k, sizeof(sl_burn_t), SL_BURN_MAGIC)) {
+            sl_burn_t bu;
+            memcpy(&bu, b, sizeof bu);
+            s_srx_ms = rx; s_rx_ok++; s_stx_due = true; s_stx_burst = true;
+            if (s_sul.active && s_sul.cmd == SL_C_BURN && s_sul.sent && bu.idx == (uint8_t)s_sul.arg) stand_ack(s_sul.seq, SL_RC_OK);
+            emit_sburn(bu);
+            return;
         } else if (sl_check(b, (size_t)k, sizeof(sl_curve_t), SL_CRV_MAGIC)) {
             memcpy(&cv, b, sizeof cv);
             s_srx_ms = rx; s_rx_ok++; s_stx_due = true;

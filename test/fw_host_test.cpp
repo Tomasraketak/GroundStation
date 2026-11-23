@@ -539,6 +539,31 @@ static void t_stand()
     CHECK(split(SC).size() == 4 + 32 && SC.compare(0, 19, "$SC,3,32,16,0.00,10") == 0, "$SC line with 16 + 16 values");
     CHECK(contains(v, ",CURVE,2,ACK,1,"), "the CURVE packet itself acknowledges the request");
 
+    // cropped burn: BURN request, $SB blocks, no heartbeat inside the burst
+    usb("CMD BURN 0"); step(1); lines(); reset_tx();
+    t = stlm(); air(&t, sizeof t); step(20);
+    CHECK(sent_cmd(0, c) && c.cmd == SL_C_BURN && c.arg == 0 && c.arg2 == 0, "BURN 0 (all blocks) requested");
+    {
+        sl_burn_t bu = {};
+        bu.test_no = 3; bu.idx = 0; bu.n_blocks = 3; bu.n = 40; bu.fexp = 0; bu.rate_hz = 50; bu.flags = 0x1B;
+        bu.t_first_ms = -100; bu.burn_a_ms = 150; bu.burn_b_ms = 2150; bu.t1_dc = 251; bu.t2_dc = SL_T_NONE;
+        for (int i = 0; i < 40; i++) { bu.f[i] = (int16_t)(i * 10); bu.p[i] = (int16_t)(i * 20); }
+        sl_seal(&bu, sizeof bu, SL_BURN_MAGIC);
+        reset_tx();
+        air(&bu, sizeof bu); step(30);
+        v = lines();
+        const std::string SB = find(v, "$SB,");
+        CHECK(split(SB).size() == 12 + 80 && SB.rfind("$SB,3,0,3,40,50,27,-100,150,2150,25.1,nan,0.00,1.00", 0) == 0, "$SB line '%.60s'", SB.c_str());
+        CHECK(contains(v, ",BURN,2,ACK,1,"), "the first block acknowledges BURN");
+        CHECK(LoRa.tx.empty(), "no PING after a burst block (would collide with the next block)");
+        bu.idx = 1; sl_seal(&bu, sizeof bu, SL_BURN_MAGIC);
+        usb("CMD BURN 2 1"); step(1); lines();
+        air(&bu, sizeof bu); step(30);
+        CHECK(sent_cmd(0, c) && c.cmd == SL_C_BURN && c.arg == 2 && c.arg2 == 1, "a pending command (missing block) goes right after a block");
+        lines();
+        usb("CANCEL"); step(2); lines();
+    }
+
     // CAL in N -> mN on the air
     usb("CMD CAL 98.0665"); step(1); lines(); reset_tx();
     t = stlm(); air(&t, sizeof t); step(20);

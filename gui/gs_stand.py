@@ -147,9 +147,7 @@ class StandPanel(QtWidgets.QWidget):
         self.win = win                      # GroundStation window: send(), cmd(), note(), settings
         self.t_start = time.time()
         self._last_test = None              # test_no of the result on screen
-        self._dl_test = None                # curve being downloaded
-        self._dl_off = None
-        self._dl_t = 0.0
+        self._bd = None                     # burn download: dict(test, t0, last, rounds)
         self._saved = set()
         self._hang_since = None
         self._prev_state = None
@@ -197,7 +195,7 @@ class StandPanel(QtWidgets.QWidget):
         self.curve = CurvePlot()
         rl.addWidget(self.curve, 1)
         row = QtWidgets.QHBoxLayout()
-        self.dl_btn = kbutton("Stáhnout křivku", "", "Stáhne 100 Hz křivku posledního testu z rampy (LoRa)")
+        self.dl_btn = kbutton("Stáhnout zážeh", "", "Znovu stáhne ořízlý zážeh posledního testu z rampy (LoRa, 50 Hz)")
         self.dl_btn.clicked.connect(lambda: self.start_download(force=True))
         self.res_btn = kbutton("Vyžádat výsledek", "", "Rampa znovu pošle souhrn posledního testu")
         self.res_btn.clicked.connect(lambda: self.win.cmd("RESULT"))
@@ -329,7 +327,8 @@ class StandPanel(QtWidgets.QWidget):
             ch.clear()
         self.curve.clear()
         self.res_lb.setText("Zatím žádný test.")
-        self._last_test = self._dl_test = self._dl_off = None
+        self._last_test = None
+        self._bd = None
         self._hang_since = None
         self._prev_state = None
         self._note = None
@@ -443,9 +442,12 @@ class StandPanel(QtWidgets.QWidget):
         self._show_result()
 
     def on_curve(self):
-        if self._dl_test is None:
-            return
-        self._dl_next()
+        pass                                # the old 100 Hz CURVE transfer is not used any more
+
+    def on_burn(self):
+        if self._bd is not None:
+            self._bd["last"] = time.time()
+            self._bd_step()
 
     def on_uplink(self, name: str, what: str, rc: int):
         txt = gp.SL_RC[rc] if 0 <= rc < len(gp.SL_RC) else str(rc)
@@ -462,55 +464,80 @@ class StandPanel(QtWidgets.QWidget):
         elif name == "ABORT" and what == "ACK":
             self._say("ABORT potvrzen rampou", "bad")
 
-    # ------------------------------------------------------------------ curve download
+    # ------------------------------------------------------------------ burn download
+    # The rampa crops the burn itself and sends it in 40-point blocks back to back
+    # (BURN 0 0). Whatever got lost is asked for again, one contiguous range at a
+    # time (BURN first count), until every block is here — typically 2-5 s for a
+    # 10 s burn; it gives up after 30 rounds / 90 s (button "Stáhnout zážeh").
     def start_download(self, force: bool = False):
         r = self.link.res
         if not r:
             self.win.cmd("RESULT")
             return
         test = gp.to_int(r.get("test_no"))
-        if not (gp.to_int(r.get("flags")) & gp.SL_RF["CURVE"]) or gp.to_int(r.get("curve_n")) == 0:
-            self.dl_lb.setText("rampa nemá křivku v paměti")
-            return
         if force:
-            self.link.curve.pop(test, None)
-        self._dl_test = test
-        self._dl_next()
+            self.link.burn.pop(test, None)
+            self._saved.discard(test)
+        now = time.time()
+        self._bd = dict(test=test, t0=now, last=now, rounds=1)
+        self.dl_lb.setText(f"stahuji zážeh #{test}…")
+        self.win.send("CMD BURN 0 0", quiet=True)
 
-    def _dl_next(self):
-        test = self._dl_test
-        st = gp.to_int(self.link.t.get("state")) if self.link.t else 0
-        if st not in (0, 6):            # never during a test: the air belongs to the live data
-            return
-        nxt = self.link.next_missing(test)
-        n = gp.to_int(self.link.res.get("curve_n"))
-        if nxt is None:
-            self._dl_test = None
-            self.dl_lb.setText(f"křivka #{test} stažena ({n} bodů)")
+    def _bd_step(self, timeout: bool = False):
+        bd = self._bd
+        test, now = bd["test"], time.time()
+        miss = self.link.burn_missing(test)
+        d = self.link.burn.get(test, {})
+        if miss == []:
+            self._bd = None
+            self.dl_lb.setText(f"zážeh #{test} stažen: {d['n']} bloků, {d['rate']} Hz, za {now - bd['t0']:.1f} s"
+                               + (f" ({bd['rounds'] - 1}× dožádáno)" if bd["rounds"] > 1 else ""))
+            self.win.note(self.dl_lb.text())
             self._show_result()
             self._save_csv(test)
             return
-        self._dl_off, self._dl_t = nxt, time.time()
-        self.dl_lb.setText(f"stahuji křivku #{test}: {100 * nxt // max(1, n)} %")
-        self.win.send(f"CMD CURVE {nxt}", quiet=True)
+        if miss is not None:
+            n = d["n"]
+            self.dl_lb.setText(f"stahuji zážeh #{test}: {n - len(miss)}/{n} bloků · {now - bd['t0']:.1f} s")
+        if not timeout:
+            return
+        if bd["rounds"] >= 30 or now - bd["t0"] > 90:
+            self._bd = None
+            self.dl_lb.setText(f"⚠ zážeh #{test} neúplný (chybí {len(miss) if miss else '?'} bloků) – "
+                               "zkus „Stáhnout zážeh“, celý záznam je ve flash rampy")
+            return
+        if miss is None:
+            self.win.send("CMD BURN 0 0", quiet=True)
+        else:                                   # the first contiguous run of missing blocks
+            a = miss[0]
+            k = 1
+            while k < len(miss) and miss[k] == a + k:
+                k += 1
+            self.win.send(f"CMD BURN {a} {k}", quiet=True)
+        bd["rounds"] += 1
+        bd["last"] = now
 
     def _save_csv(self, test: int):
         if test in self._saved:
             return
-        pts = self.link.curve_points(test)
+        pts = self.link.burn_points(test)
         if not pts:
             return
         r = self.link.res
+        d = self.link.burn[test]
         path = os.path.join(self.stand_dir(), time.strftime(f"test_{test:03d}_%Y%m%d_%H%M%S.csv"))
         try:
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 wr = csv.writer(fh)
                 for k in self.link.SR_FIELDS:
                     wr.writerow([f"# {k}", r.get(k, "")])
-                wr.writerow([f"# force unit", self.link.force_unit() if gp.to_int(r.get('flags')) & gp.SL_RF["LC_CAL"] else "uV/V"])
-                wr.writerow(["t_s", "force", "pressure_psi"])
-                for tt, f, p in zip(*pts):
-                    wr.writerow([f"{tt:.3f}", f"{f:.2f}", f"{p:.1f}"])
+                wr.writerow(["# force unit", "N" if gp.to_int(r.get("flags")) & gp.SL_RF["LC_CAL"] else "uV/V"])
+                wr.writerow(["# rate_hz (cropped burn over LoRa)", d["rate"]])
+                wr.writerow(["# burn start s", "" if d["a"] is None else d["a"] / 1000])
+                wr.writerow(["# burn end s", "" if d["b"] is None else d["b"] / 1000])
+                wr.writerow(["t_s", "force", "pressure_psi", "t1_C", "t2_C"])
+                for tt, f, p, a, b in zip(*pts):
+                    wr.writerow([f"{tt:.3f}", f"{f:.2f}", f"{p:.1f}", f"{a:.1f}", f"{b:.1f}"])
             self._saved.add(test)
             self.win.note(f"křivka testu #{test} uložena: {path}")
         except OSError as ex:
@@ -542,13 +569,13 @@ class StandPanel(QtWidgets.QWidget):
             f"({pmax * 0.0689476:.1f} bar) · max. T1 {fmt(gp.to_float(r.get('t1max')), '{:.1f}')} °C · "
             f"T2 {fmt(gp.to_float(r.get('t2max')), '{:.1f}')} °C · "
             f"{gp.to_int(r.get('n_frames'))} vzorků @ {gp.to_int(r.get('sps'))} S/s na flash")
-        pts = self.link.curve_points(test)
+        pts = self.link.burn_points(test)
         if pts:
-            ign = gp.to_float(r.get("ign_delay"), 0.0)
-            self.curve.set(*pts, unit=unit, title=f"Test #{test}: tah a tlak (100 Hz)",
-                           burn=(ign, ign + burn) if burn > 0 else None)
-        elif self.curve.title != f"Test #{test}: stahuji křivku…":
-            self.curve.clear(f"Test #{test}: stahuji křivku…")
+            d = self.link.burn[test]
+            span = (d["a"] / 1000, d["b"] / 1000) if d["a"] is not None and d["b"] is not None else None
+            self.curve.set(*pts[:3], unit=unit, title=f"Test #{test}: zážeh – tah a tlak ({d['rate']} Hz)", burn=span)
+        elif self.curve.title != f"Test #{test}: stahuji zážeh…":
+            self.curve.clear(f"Test #{test}: stahuji zážeh…")
 
     # ------------------------------------------------------------------ 10 Hz
     def refresh(self):
@@ -624,9 +651,9 @@ class StandPanel(QtWidgets.QWidget):
         self.dl_btn.setEnabled(bool(L.res) and st in (0, 6))
         self.res_btn.setEnabled(fresh)
 
-        # --- curve download that lost a packet: ask again
-        if self._dl_test is not None and now - self._dl_t > 4.0 and st in (0, 6):
-            self._dl_next()
+        # --- burn download: the burst went quiet -> ask for the missing blocks
+        if self._bd is not None and now - self._bd["last"] > 1.2 and st in (0, 6):
+            self._bd_step(timeout=True)
 
         # --- hang-fire
         if self._hang_since is not None:

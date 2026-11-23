@@ -226,7 +226,11 @@ check(wait_for(app, lambda: gp.to_float(w.link.t.get("f9")) > 100, 2), "live thr
 if OUT:
     w.grab().save(os.path.join(OUT, "stand_burn.png"))
 check(wait_for(app, lambda: bool(w.link.res), 6), "results received")
-check(wait_for(app, lambda: w.link.curve_points(gp.to_int(w.link.res.get("test_no"))) is not None, 15), "curve downloaded over LoRa")
+check(wait_for(app, lambda: w.link.burn_points(gp.to_int(w.link.res.get("test_no"))) is not None, 30),
+      "cropped burn downloaded over LoRa (15 % blocks lost, re-requested): " + w.stand.dl_lb.text())
+bd = w.link.burn[gp.to_int(w.link.res.get("test_no"))]
+check(bd["rate"] == 50 and abs(bd["a"] - 250) <= 20 and abs(bd["b"] - 2900) <= 40,
+      f"burn {bd['a']} .. {bd['b']} ms (demo motor 250 .. ~2900), {bd['n']} blocks @ {bd['rate']} Hz")
 spin(app, 0.5)
 r = w.link.res
 check(abs(gp.to_float(r["peak"]) - 210) < 5, f"peak {r['peak']} N")

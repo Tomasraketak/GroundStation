@@ -106,7 +106,8 @@ tlačítkem se stáhnou i pro offline použití na místě); bez něj GUI kresl�
   nastavení (rozbuška, puls, odpočet, délka záznamu), TARE, nula tlaku, kalibrace závažím, zkušební záznam,
   bzučák; ruční bezpečnostní body; **① ODJISTIT** (jen když je vše zelené a odškrtnuté) a **② ZAPÁLIT**
   (potvrzení napsáním `ZAPAL`); ZAJISTIT. Po testu výsledek (špička, impulz, hoření, průměr, **třída motoru**,
-  zpoždění zážehu, max. tlak a teploty), automatické stažení 100 Hz křivky přes LoRa, graf a CSV do
+  zpoždění zážehu, max. tlak a teploty), automatické stažení **ořízlého zážehu** (50 Hz, rampa sama najde
+  začátek a konec hoření, ztracené bloky se vyžádají znovu – 10 s zážeh za pár sekund) přes LoRa, graf a CSV do
   `Dokumenty\GroundStation\stand`. Po odpálení bez tahu velké varování **NEZAŽEHL** s 5min odpočtem.
   Postup a zapojení: README repa [RampaCode](https://github.com/Tomasraketak/RampaCode#test-motoru-měření-tahu).
 

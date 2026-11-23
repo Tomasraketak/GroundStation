@@ -736,6 +736,8 @@ class GroundStation(QtWidgets.QMainWindow):
             self.stand.on_result()
         elif tag == "$SC" and self.key == "STAND":
             self.stand.on_curve()
+        elif tag == "$SB" and self.key == "STAND":
+            self.stand.on_burn()
 
     def _on_uplink(self, name: str, what: str, rc: int):
         if what == "QUEUED":

@@ -28,7 +28,8 @@ Stejně funguje podržení levého tlačítka stanice 3 s (ZENITH → ARIADNA �
 | `$AS,…` | ARIADNA | sync / ACK / rampa: rssi, snr, rocket_t_ms, utc_ms (−1 = neznámo), next_rx_ms, rx_dur_ms, t_launch_rem_ms, last_cmd_seq, last_cmd_rc, rampa_state, rampa_flags, rampa_fault, sync_flags, rampa_vbat_mV |
 | `$ST,…` | STAND | telemetrie rampy jako zkušebního stavu: rssi, snr, state (`sl_state_t`: 0 SAFE, 1 ARMING, 2 ARMED, 3 COUNTDOWN, 4 FIRING, 5 BURN, 6 ABORT, 7 RECORD), faults (`SL_FLT_*`), flags (`SL_F_*`), ack_seq, ack_rc, vbat_V, v5_V, t_rel_ms (< 0 do T-0), 10× tah (nejstarší první, rovnoměrně od minulého paketu; N, bez kalibrace µV/V), špička tahu, tlak psi, špička tlaku, T1, T2 °C (`nan` = nepřipojeno), test_no, flash volno %, průběh %, vzorků/s, rozbuška, kontinuita (bit0–2), servo bezpečnostního spínače (bit0 nastaveno – klíč sepne servo při ARM, bit1 sepnuto) |
 | `$SR,…` | STAND | výsledek testu: test_no, flags (`SL_RF_*`), rozbuška, špička, impulz, hoření s, průměrný tah, čas špičky, zpoždění zážehu, max. tlak psi, max. T1, T2, bodů křivky, Hz křivky, vzorků na flash, vzorků/s, index T-0 v křivce (−1 bez zážehu) |
-| `$SC,test,offset,n,f1..fn,p1..pn` | STAND | kus 100 Hz křivky (tah, tlak psi) na `CMD CURVE <offset>` |
+| `$SC,test,offset,n,f1..fn,p1..pn` | STAND | kus 100 Hz křivky (tah, tlak psi) na `CMD CURVE <offset>` (starší způsob) |
+| `$SB,test,blok,bloků,n,Hz,flags,t_first_ms,burn_a_ms,burn_b_ms,T1,T2,f1..fn,p1..pn` | STAND | blok ořízlého zážehu na `CMD BURN`: bod i bloku k je v čase `t_first_ms + (k·40 + i)·1000/Hz` od T-0; `burn_a/b_ms` = detekovaný začátek / konec hoření (−2147483648 = nehořelo); T1/T2 °C na začátku bloku |
 | `#OK …` / `#ERR …` | oba | odpověď |
 
 Bitové masky viz `firmware/common/zenith_link.h` (`ZL_TF_*`, `ZL_HL_*`, `ZL_RMP_*`, `ZL_RMPF_*`),
@@ -89,10 +90,12 @@ jiným příkazem.
 | `RECORD` (`REC`) / `STOP` | s / – | zkušební záznam bez pyro / konec záznamu |
 | `RECTIME` | 2–120 s | délka záznamu po T-0 (uloží se v rampě) |
 | `RESULT` / `CURVE` | – / první bod | znovu `$SR` / jeden `$SC` (16 bodů) |
+| `BURN` | [první blok] [počet, 0 = všechny] | ořízlý zážeh (50 Hz, bloky po 40 bodech) za sebou v jedné dávce; ztracené bloky se vyžádají znovu |
 | `BUZZER` (`LOCATE`) | 0 / 1 | bzučák rampy |
 
 Nejsou RX okna: rampa poslouchá vždy, když nevysílá. Stanice pošle čekající příkaz 6 ms po každém paketu
 rampy a opakuje ho, dokud ho telemetrie nepotvrdí (`ack_seq` + `ack_rc`: 1 OK, 2 špatný stav, 3 blokování,
 4 argument, 5 přerušeno, 6 zaneprázdněno); po 12 odesláních / 8 s `FAILED`. Když rampu 1,5 s neslyší,
 vysílá naslepo (PING à 700 ms – tím rampu probudí do režimu test motoru; ABORT à 300 ms, 15 s). `CURVE`
-potvrzuje sám paket křivky. Rampa duplicitní `seq` neprovede dvakrát.
+potvrzuje sám paket křivky, `BURN` první blok dávky. Během dávky stanice po blocích neposílá PING
+(srazil by se s dalším blokem), jen skutečný příkaz. Rampa duplicitní `seq` neprovede dvakrát.
